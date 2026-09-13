@@ -1,0 +1,152 @@
+#!/bin/bash
+
+# --- ENCODE AUDIT ---
+# Reports which files were encoded by the current version of ./encode (v3.0) and
+# which came from an older version, so you know what still needs re-encoding.
+#
+# How it works: x265 stamps its full parameter list into an SEI NAL at the head of
+# the bitstream. encode v3.0 is the first version to pass --encopts, so the presence
+# of "aq-mode=3" in that stamp is a fingerprint no earlier version could produce
+# (x265 defaults to aq-mode=2, or aq-mode=0 under --encoder-tune grain).
+
+set -uo pipefail
+
+if ! command -v ffmpeg &> /dev/null || ! command -v ffprobe &> /dev/null; then
+    echo "Error: ffmpeg and ffprobe must be installed."
+    exit 1
+fi
+
+MODE="report"
+
+usage() {
+    echo "Usage: $0 [--stale|--current|--tsv] <path> [<path>...]"
+    echo "  <path>    : A media file, or a directory to walk recursively"
+    echo "  --stale   : Print only files NOT encoded by the current script version"
+    echo "  --current : Print only files encoded by the current script version"
+    echo "  --tsv     : Print the full fingerprint of every file, tab separated"
+    exit 1
+}
+
+PATHS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stale)   MODE="stale"; shift ;;
+        --current) MODE="current"; shift ;;
+        --tsv)     MODE="tsv"; shift ;;
+        -h|--help) usage ;;
+        -*)        usage ;;
+        *)         PATHS+=("$1"); shift ;;
+    esac
+done
+
+[[ ${#PATHS[@]} -eq 0 ]] && usage
+
+# Pull the x265 parameter stamp out of the first couple of video frames.
+# Note: pipe through tr, not strings -- strings truncates at 1024 bytes and the
+# stamp is ~2.3KB, which cuts off everything past the encoder-tweak options.
+read_x265_opts() {
+    ffmpeg -v quiet -i "$1" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -frames:v 2 -f hevc - 2>/dev/null \
+        | LC_ALL=C tr -c '[:print:]' '\n' \
+        | grep -m1 'x265.*options:'
+}
+
+classify() {
+    local FILE_PATH="$1"
+    local VCODEC OPTS AQ GRAIN RD RDOQ CRF NSUB VERDICT PROFILE PRESET
+
+    VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+             -of default=nw=1:nk=1 "$FILE_PATH" 2>/dev/null)
+
+    if [[ "$VCODEC" != "hevc" ]]; then
+        # The script only ever emits x265 10-bit, so anything else never went through it.
+        RESULT_VERDICT="not-encoded"
+        RESULT_DETAIL="source is ${VCODEC:-unreadable}, never run through encode"
+        return
+    fi
+
+    OPTS=$(read_x265_opts "$FILE_PATH")
+    if [[ -z "$OPTS" ]]; then
+        RESULT_VERDICT="unknown"
+        RESULT_DETAIL="hevc, but no x265 parameter stamp found"
+        return
+    fi
+
+    opt() { grep -o "[[:space:]]$1=[^[:space:]]*" <<<"$OPTS" | head -1 | cut -d= -f2-; }
+    has() { grep -q "[[:space:]]$1[[:space:]]" <<<"$OPTS"; }
+
+    AQ=$(opt aq-mode); RD=$(opt rd); RDOQ=$(opt rdoq-level); CRF=$(opt crf)
+    GRAIN="no"; has rc-grain && GRAIN="yes"
+
+    # rd is the cleanest proxy for --encoder-preset in the x265 stamp
+    case "$RD" in
+        2) PRESET="fast" ;;
+        3) PRESET="medium" ;;
+        4) PRESET="slow" ;;
+        *) PRESET="rd=$RD" ;;
+    esac
+
+    NSUB=$(ffprobe -v error -select_streams s -show_entries stream=index \
+           -of csv=p=0 "$FILE_PATH" 2>/dev/null | grep -c .)
+
+    if [[ "$AQ" == "3" ]]; then
+        RESULT_VERDICT="current"
+        # Map the preset + tune + quality target back onto the profile engine
+        if [[ "$GRAIN" == "yes" ]]; then
+            PROFILE="gritty"
+        elif [[ "$PRESET" == "slow" ]]; then
+            PROFILE="clean"
+        elif [[ "$PRESET" == "fast" && "$CRF" == "21.0" ]]; then
+            PROFILE="action or clean(br)"   # both use preset fast; indistinguishable here
+        elif [[ "$PRESET" == "fast" ]]; then
+            PROFILE="action"
+        else
+            PROFILE="unmapped"
+        fi
+        RESULT_DETAIL="v3.0 | profile: $PROFILE | preset $PRESET | crf $CRF | subs $NSUB"
+    elif [[ "$GRAIN" == "yes" && "$AQ" == "0" ]]; then
+        RESULT_VERDICT="old"
+        RESULT_DETAIL="pre-v3.0 (-g grain) | preset $PRESET | crf $CRF | subs $NSUB"
+    else
+        RESULT_VERDICT="old"
+        RESULT_DETAIL="pre-v3.0 | preset $PRESET | crf $CRF | aq-mode $AQ | subs $NSUB"
+    fi
+}
+
+C_CUR=0; C_OLD=0; C_RAW=0; C_UNK=0
+
+[[ "$MODE" == "tsv" ]] && printf 'verdict\tdetail\tpath\n'
+
+while IFS= read -r FILE_PATH; do
+    RESULT_VERDICT=""; RESULT_DETAIL=""
+    classify "$FILE_PATH"
+
+    case "$RESULT_VERDICT" in
+        current)     C_CUR=$((C_CUR + 1)) ;;
+        old)         C_OLD=$((C_OLD + 1)) ;;
+        not-encoded) C_RAW=$((C_RAW + 1)) ;;
+        *)           C_UNK=$((C_UNK + 1)) ;;
+    esac
+
+    case "$MODE" in
+        stale)   [[ "$RESULT_VERDICT" != "current" ]] && echo "$FILE_PATH" ;;
+        current) [[ "$RESULT_VERDICT" == "current" ]] && echo "$FILE_PATH" ;;
+        tsv)     printf '%s\t%s\t%s\n' "$RESULT_VERDICT" "$RESULT_DETAIL" "$FILE_PATH" ;;
+        *)       printf '%-12s %-62s %s\n' "[$RESULT_VERDICT]" "$RESULT_DETAIL" "$(basename "$FILE_PATH")" ;;
+    esac
+done < <(
+    for P in "${PATHS[@]}"; do
+        if [[ -f "$P" ]]; then
+            echo "$P"
+        elif [[ -d "$P" ]]; then
+            find "$P" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.webm' \
+                -o -iname '*.avi' -o -iname '*.m4v' \) | sort
+        else
+            echo "WARNING: skipping $P (not a file or directory)" >&2
+        fi
+    done
+)
+
+if [[ "$MODE" == "report" ]]; then
+    echo "----------------------------------------"
+    echo "Current (v3.0): $C_CUR | Older version: $C_OLD | Never encoded: $C_RAW | Unknown: $C_UNK"
+fi

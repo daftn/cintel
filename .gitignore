@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# pipeline working directories
+plans/
+work/
+stage/
+needs_review/
+retired/
