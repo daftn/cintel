@@ -20,14 +20,17 @@ Safety properties that matter at fleet scale:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+import analyze
 import verify
 
 OUTPUT_TOKEN = "{OUTPUT}"
@@ -91,6 +94,25 @@ def apply_sample(argv: list[str], seconds: int, source_dur: float | None
     return out
 
 
+def stamp_toolchain(argv: list[str]) -> list[str]:
+    """Record the toolchain that ACTUALLY produced this output.
+
+    Not a decision - provenance, in the same spirit as substituting {OUTPUT}
+    or injecting -ss/-t for a sample. The plan records what MEASURED the
+    source, but a plan may legitimately be generated on one machine and
+    executed on another; several of this pipeline's rules are
+    ffmpeg-version-specific, so a library encoded across two toolchains is
+    unattributable without this. Inserted before the output path, which is
+    always the final argument.
+    """
+    out = list(argv)
+    for key, value in (("ENCODE_FFMPEG", analyze.ffmpeg_version()),
+                       ("ENCODE_X265", analyze.x265_version())):
+        out.insert(len(out) - 1, "-metadata")
+        out.insert(len(out) - 1, f"{key}={value}")
+    return out
+
+
 def encode_one(plan_file: Path, out_root: Path, work_dir: Path,
                flatten: bool, replace: bool, dry_run: bool,
                progress: bool, sample: int | None = None,
@@ -135,6 +157,7 @@ def encode_one(plan_file: Path, out_root: Path, work_dir: Path,
         cmd = argv[:-1] + [partial.as_posix()]
     if sample:
         cmd = apply_sample(cmd, sample, probe_duration(src))
+    cmd = stamp_toolchain(cmd)
     if replace:
         cmd.insert(1, "-y")
 
@@ -196,6 +219,11 @@ def add_args(ap: argparse.ArgumentParser) -> None:
                     help="rewrite a path prefix, e.g. /Volumes/nas=/mnt/nas")
     ap.add_argument("--ignore-stale", action="store_true",
                     help="run plans even if they predate the current analyzer")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="encode N titles concurrently (default 1). At 480p a "
+                         "single encode cannot saturate many cores, so 2-4 "
+                         "beats one wide encode; past ~4 you contend on NAS "
+                         "reads rather than gaining throughput")
     ap.add_argument("--sample", type=int, metavar="SECONDS",
                     help="encode only a short window from the middle; "
                          "validates a plan without a full encode")
@@ -218,7 +246,6 @@ def run_cmd(args: argparse.Namespace) -> int:
     expected = None
     if not args.ignore_stale:
         try:
-            import analyze
             expected = analyze.analyzer_fingerprint()
         except Exception:  # noqa: BLE001
             expected = None
@@ -230,30 +257,51 @@ def run_cmd(args: argparse.Namespace) -> int:
     encoded = 0
     batch_started = time.time()
 
-    print(f"{len(plan_files)} plans; output -> {out_root}", file=sys.stderr)
+    jobs = max(1, args.jobs)
+    print(f"{len(plan_files)} plans; output -> {out_root}"
+          + (f"; {jobs} concurrent" if jobs > 1 else ""), file=sys.stderr)
 
-    for i, pf in enumerate(plan_files, 1):
+    # Concurrency is safe here only because each encode writes to a .partial
+    # keyed to a hash of its DESTINATION (see encode_one). That was bug 3;
+    # without it, parallel encodes corrupt each other.
+    stop = threading.Event()
+    marker = {"encoded": "ok", "skipped": "--", "review": "??",
+              "stale": "!!", "failed": "XX"}
+
+    def work(i: int, pf: Path):
+        if stop.is_set():
+            return (i, pf, None, None)
         try:
             status, detail = encode_one(
                 pf, out_root, work_dir, args.flatten, args.replace,
                 args.dry_run, args.progress, args.sample, expected, remap)
-        except KeyboardInterrupt:
-            print("\ninterrupted; partial output discarded", file=sys.stderr)
-            return 130
         except Exception as exc:  # noqa: BLE001 - one bad file must not stop the batch
             status, detail = "failed", repr(exc)
+        return (i, pf, status, detail)
 
-        counts[status] = counts.get(status, 0) + 1
-        marker = {"encoded": "ok", "skipped": "--", "review": "??",
-                  "stale": "!!", "failed": "XX"}.get(status, "  ")
-        print(f"[{i}/{len(plan_files)}] {marker} {pf.stem}: {detail}",
-              file=sys.stderr)
-
-        if status == "encoded":
-            encoded += 1
-            if args.limit and encoded >= args.limit:
-                print(f"\nreached --limit {args.limit}", file=sys.stderr)
-                break
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(work, i, pf)
+                       for i, pf in enumerate(plan_files, 1)]
+            for fut in concurrent.futures.as_completed(futures):
+                i, pf, status, detail = fut.result()
+                if status is None:  # skipped after --limit was reached
+                    continue
+                counts[status] = counts.get(status, 0) + 1
+                print(f"[{i}/{len(plan_files)}] {marker.get(status, '  ')} "
+                      f"{pf.stem}: {detail}", file=sys.stderr)
+                if status == "encoded":
+                    encoded += 1
+                    if args.limit and encoded >= args.limit and not stop.is_set():
+                        stop.set()
+                        print(f"\nreached --limit {args.limit}; "
+                              "no further titles will start", file=sys.stderr)
+    except KeyboardInterrupt:
+        # ffmpeg shares this process group, so it has already taken the same
+        # SIGINT; encode_one unlinks the .partial on a non-zero exit.
+        stop.set()
+        print("\ninterrupted; partial output discarded", file=sys.stderr)
+        return 130
 
     print("\n--- summary ---", file=sys.stderr)
     for k in sorted(counts):

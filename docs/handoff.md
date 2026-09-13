@@ -39,20 +39,23 @@ scripts/transcode/          ~1,570 lines, stdlib only, no install step
 scripts/encode_audit        standalone x265-SEI fingerprinter (pre-dates the pipeline)
 ```
 
-Run with `python3 scripts/transcode <stage>`. Nothing is committed to git yet.
+Run with `python3 cintel <stage>`. (This section's `scripts/transcode/` paths predate the
+move into the `cintel` repo; the layout is otherwise unchanged.)
 
 ### 2.2 Library
 
 | Location | Files | Meaning |
 |---|---:|---|
 | `raw/dvd/movies` | 436 | queued |
-| `raw/dvd/tv` | 751 | queued (incl. 184 Office — **drop, Blu-rays purchased**) |
+| `raw/dvd/tv` | 752 | queued (incl. 185 Office — **drop, Blu-rays purchased**) |
 | `raw/bluray/movies` | 20 | queued |
 | `raw/bluray/tv` | 16 | queued |
 | `movies/` | 247 | library (220 old HEVC encodes + 27 mp4 downloads) |
 | `tv/` | 1,932 | library (547 old HEVC + h264/av1 downloads) |
 
-**~1,039 titles to encode** after dropping Office.
+**~1,039 titles to encode** after dropping Office. (Counts re-verified on the encode box
+2026-09-12: 436 / 752 / 20 / 16. The earlier 751 and 184 were each one low; `raw/` totals
+3.8 TB.)
 
 ### 2.3 Plans generated
 
@@ -76,7 +79,7 @@ exactly one decision with nothing filled in by default**, which is what makes ve
 possible. You cannot assert that HandBrake's output matches a plan, because HandBrake never
 tells you what it decided.
 
-Honest cost: two of the nine bugs below (colour tagging, audio track duplication) were
+Honest cost: two of the bugs below (colour tagging, audio track duplication) were
 things HandBrake did correctly for free.
 
 **This only pays off because `verify` exists.** Raw ffmpeg without verification would be
@@ -135,7 +138,7 @@ Disc sources are frequently **untagged**. Untagged HEVC is read as BT.709, which
 colour badly on 480-line content that is really BT.601.
 
 Measured, and non-obvious: ffmpeg's `-color_primaries` and `-color_trc` **never reach
-libx265 at any argument position**. Only `-colorspace` survives. Colour must go inside the
+libx265 at any argument position**. Colour must go inside the
 x265 parameter string:
 
 ```
@@ -147,6 +150,18 @@ x265 parameter string:
 | ffmpeg flags after `-x265-params` | `smpte170m, unknown, unknown` ✗ |
 | **inside `-x265-params`** | `smpte170m, smpte170m, smpte170m` ✓ |
 | ffmpeg flags before `-c:v` | `smpte170m, unknown, unknown` ✗ |
+
+Re-measured on Ubuntu 2026-09-12 (see §7.2). Two corrections to what was written here
+before:
+
+- An earlier draft of this section said "only `-colorspace` survives". That contradicts the
+  table above and is **wrong**: it is `primaries` that survives, while transfer and matrix
+  are lost. The operative conclusion — put colour inside `-x265-params` — is unchanged.
+- **The failure is version-specific in a way that can mislead a re-test.** On ffmpeg 6.1.1
+  (Ubuntu 24.04's stock package, x265 3.5) ffmpeg's own colour flags *do* work, so the bug
+  does not reproduce at all. It reproduces exactly as tabulated on 8.1.2 and 9.0.1. Anyone
+  re-testing this rule on a stock Ubuntu ffmpeg will wrongly conclude the flags are fine.
+  Never relax this rule on the strength of a 6.1.1 measurement.
 
 ### 3.6 Preset and CRF
 
@@ -210,6 +225,13 @@ software x265, and throughput is not the binding constraint for a one-time pass.
 
 Four of five branches avoid re-encoding audio entirely.
 
+- **"Lossless" is decided by profile, not codec name.** ffprobe reports `codec_name: dts`
+  for both the lossy DTS core and lossless DTS-HD MA; only `profile` separates them. The
+  analyzer originally treated every `dts` stream as lossless, which sent ordinary lossy DTS
+  5.1 — common on DVD, a tier that cannot carry DTS-HD MA at all — through an E-AC3
+  re-encode for no benefit. `analyze.is_lossless_audio()` now checks the profile, and a
+  `dts` stream with no profile is treated as **lossy and copied**, that being the
+  reversible choice.
 - **Lossless is transcoded, not copied.** Dune Part 1's TrueHD track was **3.77 GB of a
   6.86 GB file — larger than the video.** E-AC3 640k reduces that to ~0.75 GB.
 - **7.1 is capped to 5.1.** At a fixed 640k, eight channels get ~80k each versus ~107k for
@@ -221,6 +243,49 @@ Four of five branches avoid re-encoding audio entirely.
 - **Non-English audio is dropped.** 45% of files carry it (avg 0.7 foreign tracks each).
 - ffmpeg's default `-ac 2` downmix is quiet and dialogue-light; an explicit `pan` matrix is
   used when synthesizing.
+
+### 3.8a A/V sync: measure DRIFT, and never on a sample with av_drift
+
+DVD rips do go out of sync, so `verify` checks it — but the check has to separate two
+different things.
+
+**Skew already in the source is correct to preserve.** Discs are authored with small fixed
+audio offsets and MakeMKV passes them through faithfully. `Charmed - s01e01` carries
+**−168 ms**, and "correcting" that would be the bug. So, exactly as with duplicate frames
+(§4.3), the question is whether the *encode* introduced desync, not whether any exists.
+
+**Absolute lip-sync is not checkable** without content analysis (SyncNet-class models). No
+attempt is made. What *is* cheaply checkable is **progressive drift**, which is the failure
+mode that actually occurs here, because it means a frame-rate or cadence assumption is
+wrong.
+
+Two measurements, because one method does not cover both cases:
+
+| | Method | Why |
+|---|---|---|
+| Full encode | `av_drift` — (a−v skew at end) − (same at start), compared against the source | A constant offset cancels; only accumulating desync survives |
+| Sample | `av_span_ratio` — video timespan ÷ audio timespan | `av_drift` is **unusable** on a sample (see below) |
+
+> **The trap, found while validating this.** A sampled encode is cut with an input `-ss`,
+> which lands on the first decodable frame after the seek point. The video's first PTS can
+> therefore sit hundreds of ms after the audio's — measured at **416 ms** on a test clip and
+> **189 ms** on a real `--sample 90` of a Charmed episode. `av_drift` reads that head offset
+> as drift and fails a perfectly good sample. This is bug 8 in a new costume, and it is why
+> samples use the ratio instead: a ratio ignores the head entirely.
+
+Validated by deliberately committing cardinal rule 1's catastrophe — `decimate` applied to
+`Parks and Recreation - s01e01`, which reports 29.97 in the container but **decodes at
+24.00**:
+
+| Encode of the same source | span ratio | drift | verdict |
+|---|---:|---:|---|
+| correct (no cadence filter) | 0.9964 | — | pass |
+| `decimate` on progressive content | **0.7972** | +24,413 ms | **FAIL** |
+
+0.7972 is exactly the 4/5 that dropping one frame in five produces. On a full-length
+episode that would be roughly eight minutes of accumulated desync.
+
+Measured on the four real full encodes: **−9 ms introduced**, against a 100 ms tolerance.
 
 ### 3.9 Subtitles: English only, and **no automated burn-in**
 
@@ -356,7 +421,7 @@ Always `-nostdin`, or it will consume a calling shell loop's input.
 
 ## 5. Bugs found, and why each matters
 
-All nine were found by measurement. None by reasoning.
+All were found by measurement. None by reasoning.
 
 | # | Bug | Consequence if shipped |
 |---|---|---|
@@ -369,6 +434,7 @@ All nine were found by measurement. None by reasoning.
 | 7 | A degenerate subtitle track stalls the matroska muxer | **56 frames of video in a file reporting 84 minutes.** ffmpeg exits 0, size and duration look right. Affects **46 of 1,219 files** |
 | 8 | `verify --sample` compared the sample against the source's opening credits | False failures reporting invented duplicate frames |
 | 9 | Initial CRF sweep ran on an easy segment | Nearly selected CRF 22; degradation is 4–5× steeper on hard content |
+| 10 | Every `dts` stream classified as lossless | Lossy DTS 5.1 re-encoded to E-AC3 for nothing — a gratuitous generation of loss, on a codec common across the DVD tier |
 
 ### 5.1 Bug 7 in detail — the one to understand
 
@@ -406,6 +472,8 @@ No missing video, multi-video, missing audio, or bad durations.
 | Coverage test | 4 files, all code paths | 3 pass, 1 correctly skipped as `review` |
 | Stratified sample | 25 files (12 movies, 4 shows, Blu-ray film+TV) | **25/25 analyzed, encoded, verified** |
 | Charmed batch | 4 full episodes | 3 pass, 1 exposed bug 7 |
+| **Full encodes on Ubuntu/9.0.1** | 4 real Charmed episodes + 1 sample | **5/5 verified**; −9 ms A/V drift introduced |
+| **A/V sync check** | correct vs deliberately `decimate`-broken clip | ratio 0.9964 pass / 0.7972 fail |
 | Preset comparison | slow vs medium, full episodes | medium = same size, 45% of the time |
 | CRF sweep | easy + hard segments, FFV1 reference | CRF 20 selected |
 
@@ -427,21 +495,105 @@ episode** at `medium` CRF 20, roughly 4–5× realtime. Charmed ≈ 25 hours sin
    bug 7 presented.
 3. **Drop Office** from the queue (184 files; Blu-rays purchased).
 
+### 7.1a Encode concurrency
+
+`encode --jobs N` now exists (default 1). Concurrency is safe only because each encode
+writes to a `.partial` keyed to a hash of its **destination** — that was bug 3, and without
+it parallel encodes corrupt each other.
+
+Sizing, on 8 physical cores: a single 480p encode cannot saturate them (WPP yields maybe
+6–8 useful rows at that frame height), so 2–4 concurrent titles beat one wide encode. Past
+~4 you contend on NAS reads rather than gaining throughput — the same ceiling `analyze`
+hits at `--jobs 4`.
+
+`--progress` streams raw ffmpeg output and becomes unreadable above one job.
+
 ### 7.2 Proxmox migration
 
 No macOS-specific code in the pipeline. The blocker was that plans bake in absolute paths
-(`/Volumes/nas/...`); `--remap /Volumes/nas=/mnt/nas` is implemented on encode, verify and
-publish, so plans generated on either machine work on both.
+(`/Volumes/nas/...`); `--remap` is implemented on encode, verify and publish, so plans
+generated on either machine work on both. **The container mounts the NAS at `/nas`, not
+`/mnt/nas`** — so the rewrite is `--remap /Volumes/nas=/nas`. Running `analyze` on the
+encode box avoids needing it at all.
 
 Verify on the Ubuntu box before bulk running:
 
-1. ffmpeg build has `libx265`, `libvmaf`, and the `fieldmatch`/`decimate`/`idet`/`ssim`
-   filters (Ubuntu packages are sometimes built without libvmaf)
-2. The colour-in-`x265-params` behaviour (§3.5) still holds — it is ffmpeg-version-specific.
-   Run one `--sample 60` encode and check the tags land.
-3. Measure throughput; it drives the whole schedule.
+1. ~~ffmpeg build has `libx265`, `libvmaf`, and the `fieldmatch`/`decimate`/`idet`/`ssim`
+   filters~~ — **done 2026-09-12**, see §7.2.1
+2. ~~The colour-in-`x265-params` behaviour (§3.5) still holds~~ — **done 2026-09-12**,
+   and the result changed what §3.5 says; read the correction there
+3. ~~Measure throughput~~ — **done 2026-09-12**, see §7.2.2.
 
-All three are answered by one `--sample 60` encode plus a `verify`.
+#### 7.2.1 Toolchain on the Ubuntu box (resolved 2026-09-12)
+
+The stock Ubuntu 24.04 ffmpeg is **6.1.1 with x265 3.5 (2021)**, and the suspicion in item 1
+was right: **libvmaf is not packaged in Ubuntu 24.04 at all** — not in main, universe or
+multiverse, so apt cannot supply it by any route.
+
+That mattered less than what the check turned up alongside it. The Mac this pipeline was
+built and tuned on runs **ffmpeg 9.0.1**. Bulk-encoding here on the stock package would have
+applied a CRF 20 tuning validated against **x265 4.2** to a five-year-older encoder —
+silently, since nothing in the pipeline recorded the encoder version.
+
+Resolved by installing the static BtbN **n9.0.1** build (x265 4.2) to `/usr/local/bin`,
+which precedes `/usr/bin` on PATH. cintel calls bare `ffmpeg`/`ffprobe`, so it picks this up
+with no code change; apt's 6.1.1 remains installed underneath and rollback is deleting two
+files. A static build was preferred over the savoury1 PPA, which would upgrade system
+libraries wholesale on a machine whose only job is encoding.
+
+Verified on n9.0.1 by running the full pipeline against a synthetic DVD-shaped title:
+
+| Check | Result |
+|---|---|
+| analyze → encode → verify | PASS, no code changes |
+| Colour tags on output (rule 2) | `smpte170m/smpte170m/smpte170m` ✓ |
+| ffmpeg's own colour flags (control) | `smpte170m/unknown/unknown` — failure reproduced |
+| x265 SEI stamp size (rule 3) | **2,303 bytes**, confirming `strings` would truncate it |
+| `libvmaf` through `verify --vmaf` | works; scored 95.83 |
+| `fieldmatch`/`decimate`/`idet`/`ssim`/`mpdecimate`/`cropdetect` | all present |
+
+**Provenance now records the toolchain.** Plans carry `ffmpeg_version` and `x265_version`
+as evidence of what *measured* the source; `encode` separately stamps `ENCODE_FFMPEG` and
+`ENCODE_X265` for the toolchain that actually *produced* the output, since a plan may be
+generated on one machine and run on another. x265's version was always recoverable from the
+SEI stamp, but that costs a bitstream extraction to read; a container tag is far cheaper to
+query across a library.
+
+#### 7.2.2 Measured throughput (2026-09-12)
+
+On CT 101 (Ryzen 7 8845HS, 8 physical cores), `medium` / CRF 20, real Charmed episodes
+(43.5 min, hard telecine so `fieldmatch,decimate` is in the chain — the expensive path):
+
+| Concurrency | Per episode | Realtime factor | Aggregate |
+|---|---:|---:|---|
+| `--jobs 1` | ~8.5 min | 5.1× | 1 episode / 8.5 min |
+| `--jobs 3` | **4.88 min** | **8.9×** | 3 episodes / 14m38s |
+
+Three-way concurrency buys **1.74×**, not 3×, because a single 480p encode already pulls
+~7.3 of the 8 physical cores (measured). The three jobs finished within 18s of each other,
+so nothing was starved. CPU held ~90% at a sustained 4,116 MHz all-core — above the 3.8 GHz
+base clock, i.e. no thermal throttling on this mobile-class part.
+
+The `--jobs 1` figure is reconstructed from file timestamps (the run's log was lost) and is
+good to about ±1 min; the `--jobs 3` figure is precise.
+
+Projected for the queue — 567 TV episodes + 436 movies + 36 Blu-rays = **1,749
+episode-equivalents** by runtime:
+
+```
+~142 hours = 5.9 days continuous at --jobs 3
+             ~10 days at 60% duty (overnight / idle-only)
+```
+
+Treat as an order-of-magnitude figure: it extrapolates from TV episodes, and movies and
+Blu-rays are not simply longer episodes.
+
+Output size, measured on four episodes: **1.58 GB → 371–479 MB**, roughly **3.5:1**. Across
+the 3.8 TB of `raw/`, that projects to ~1.1 TB of output against 3.3 TB free on the NAS.
+
+Run encodes under `nice -n 15 ionice -c3` — Jellyfin (CT 100) and Plex (CT 103) share the
+host. Note `nice` is *relative* to the parent, so the observed niceness may exceed what was
+asked for.
 
 ### 7.3 Publishing strategy
 
@@ -472,30 +624,33 @@ deleting them, so rollback is a `mv`.
 
 ## 8. Quick reference
 
+Paths below are the **Proxmox container** (CT 101): NAS at `/nas`, NVMe scratch at
+`/data`. On the Mac they were `/Volumes/nas` and `/tmp`.
+
 ```bash
 # analyze (read-only; safe to run on anything)
-python3 scripts/transcode analyze /Volumes/nas/media/raw/dvd/tv/charmed \
-    --out plans/charmed --jobs 4
+python3 cintel analyze /nas/media/raw/dvd/tv/charmed --out plans/charmed --jobs 4
 
 # validate a plan cheaply - 90s from mid-file, exercises every code path
-python3 scripts/transcode encode plans/charmed --out /tmp/stage --work /tmp/work \
+python3 cintel encode plans/charmed --out /data/cintel-stage --work /data/cintel-work \
     --flatten --sample 90
 
-# encode for real
-python3 scripts/transcode encode plans/charmed --out /tmp/stage --work /tmp/work --flatten
+# encode for real - nice/ionice because Jellyfin and Plex share this host
+nice -n 15 ionice -c3 python3 cintel encode plans/charmed \
+    --out /data/cintel-stage --work /data/cintel-work --flatten --jobs 3
 
 # verify (add --sample if the output is a sample)
-python3 scripts/transcode verify plans/charmed --out /tmp/stage --flatten
+python3 cintel verify plans/charmed --out /data/cintel-stage --flatten
 
 # publish (runs verify itself; refuses anything that fails)
-python3 scripts/transcode publish plans/charmed --from /tmp/stage \
-    --to "/Volumes/nas/media/tv/kids/Charmed" --retire /tmp/retired --seasons
+python3 cintel publish plans/charmed --from /data/cintel-stage \
+    --to "/nas/media/tv/kids/Charmed" --retire /data/cintel-retired --seasons
 
-# on Proxmox, add:  --remap /Volumes/nas=/mnt/nas
+# only if a plan was written on the Mac:  --remap /Volumes/nas=/nas
 ```
 
 Useful flags: `--force` (re-analyze), `--limit N`, `--dry-run`, `--progress`,
-`--ignore-stale`, `--replace`.
+`--ignore-stale`, `--replace`, `--jobs N`.
 
 ### Final config
 
@@ -506,7 +661,8 @@ cadence       measured per file: none / fieldmatch,decimate / needs_review
 crop          cropdetect x10, 20th-percentile margin, 8px width floor
 audio         copy where possible; lossless surround -> E-AC3 640k, 5.1 max; English only
 subtitles     English only, degenerate tracks excluded, no burn-in
-provenance    analyzer fingerprint + literal argv stamped into every output
+provenance    analyzer fingerprint + literal argv + ffmpeg/x265 version stamped in
+toolchain     ffmpeg n9.0.1 / x265 4.2 (static, /usr/local/bin) - NOT apt's 6.1.1
 ```
 
 ---
@@ -515,7 +671,7 @@ provenance    analyzer fingerprint + literal argv stamped into every output
 
 1. **Decide from the file, not from a label.** Every defect in the old library traced to a
    human-supplied profile being applied to content it didn't fit.
-2. **Measure; do not reason.** Nine bugs, all found by measurement. Two independent AI models
+2. **Measure; do not reason.** Ten bugs, all found by measurement. Two independent AI models
    reasoned their way to a filter chain that would have destroyed the library.
 3. **Verify against an explicit plan.** This is what makes the whole approach viable — it
    turns silent corruption into a loud failure.

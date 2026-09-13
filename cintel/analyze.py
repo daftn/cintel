@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import functools
 import hashlib
 import json
 import re
@@ -46,7 +47,19 @@ FPS_TOL = 0.5                # a rate must land within this of a known rate
 
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".webm", ".m2ts", ".ts"}
 IMAGE_SUB_CODECS = {"dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle", "xsub"}
-LOSSLESS_AUDIO = {"truehd", "dts", "flac", "mlp", "pcm_s16le", "pcm_s24le"}
+# Codecs that are lossless whatever the profile says.
+#
+# "dts" is deliberately NOT in this set. ffprobe reports codec_name "dts" for
+# both the lossy DTS core and lossless DTS-HD MA; only the profile separates
+# them. Measured: a lossy 5.1 DTS track reports profile "DTS", and treating it
+# as lossless transcodes an already-lossy source to E-AC3 - a pointless
+# generation of loss on a codec that dominates this library's DVD tier, which
+# cannot carry DTS-HD MA at all. Use is_lossless_audio(), not this set.
+LOSSLESS_AUDIO = {"truehd", "flac", "mlp", "pcm_s16le", "pcm_s24le"}
+
+# Of the DCA profiles only DTS-HD MA is lossless; "DTS", "DTS-ES", "DTS 96/24",
+# "DTS-HD HRA" and "DTS Express" are all lossy.
+DTS_LOSSLESS_PROFILE = "HD MA"
 
 # Quality targets. Deliberately fixed: VMAF targeting is NOT used for the DVD
 # tier because the default VMAF model is trained at 1080p and produces invalid
@@ -157,6 +170,41 @@ def cropdetect_sample(path: Path, start: int, dur: int = 2) -> tuple | None:
     return (w, h, x, y)
 
 
+def is_lossless_audio(stream: dict) -> bool:
+    """Whether an audio stream is genuinely lossless.
+
+    Matters because the lossless branch transcodes to E-AC3 640k. Doing that
+    to a lossy source adds a generation of loss for nothing, so the test has
+    to be right rather than merely convenient.
+
+    A "dts" stream whose profile is missing is treated as LOSSY, i.e. copied.
+    That is the reversible choice: an oversized copy can be re-encoded later
+    from the archived source, while a needless transcode cannot be undone.
+    """
+    codec = (stream.get("codec_name") or "").lower()
+    if codec in LOSSLESS_AUDIO:
+        return True
+    if codec == "dts":
+        return DTS_LOSSLESS_PROFILE in (stream.get("profile") or "").upper()
+    return False
+
+
+def lossless_reason(stream: dict) -> str:
+    """Why is_lossless_audio() said yes, in words fit for a plan note.
+
+    Recorded because transcoding to E-AC3 640k is the pipeline's one
+    irreversible audio decision, and bug 10 was precisely a wrong answer to
+    this question. A plan saying "eac3 640k" cannot be audited; one saying
+    "because the profile is DTS-HD MA" can - the profile is the whole basis
+    of the decision, so it belongs in the evidence rather than only in the
+    analyzer's head.
+    """
+    codec = (stream.get("codec_name") or "").lower()
+    if codec == "dts":
+        return f"profile {stream.get('profile')}"
+    return "codec is lossless regardless of profile"
+
+
 def near_fps(value: float | None, target: float) -> bool:
     return value is not None and abs(value - target) <= FPS_TOL
 
@@ -188,6 +236,11 @@ class Analysis:
     review_reason: str | None = None
     notes: list[str] = dataclasses.field(default_factory=list)
     analyzer: str | None = None
+    # Which toolchain MEASURED this source. encode.py stamps the toolchain
+    # that actually produced the output, which may differ if a plan is
+    # generated on one machine and run on another.
+    ffmpeg_version: str | None = None
+    x265_version: str | None = None
     argv: list[str] | None = None
 
 
@@ -352,15 +405,19 @@ def resolve_audio(a: Analysis, streams: list[dict]) -> None:
         # transcoding an already-lossy stereo source to AAC only adds a
         # generation of loss. Copy it and let the server do a cheap
         # audio-only transcode for any client that needs one.
-        if codec in LOSSLESS_AUDIO:
+        if is_lossless_audio(primary):
             a.audio.append({
                 "role": "stereo", "source_index": idx, "codec": "aac",
                 "bitrate": "192k", "channels": 2, "downmix": False,
+                "source_profile": primary.get("profile"),
             })
-            a.notes.append(f"lossless {codec} stereo transcoded to AAC 192k")
+            a.notes.append(
+                f"{codec} stereo is lossless ({lossless_reason(primary)}); "
+                "transcoded to AAC 192k")
         else:
             a.audio.append({
                 "role": "stereo", "source_index": idx, "codec": "copy",
+                "source_profile": primary.get("profile"),
             })
             a.notes.append(
                 f"source is {codec} {channels}ch; copied as-is "
@@ -390,16 +447,25 @@ def resolve_audio(a: Analysis, streams: list[dict]) -> None:
             "role": "stereo", "source_index": idx, "codec": "aac",
             "bitrate": "192k", "channels": 2, "downmix": True,
         })
-    if codec in LOSSLESS_AUDIO:
+    if is_lossless_audio(primary):
         a.audio.append({
             "role": "surround", "source_index": idx, "codec": "eac3",
             "bitrate": "640k", "channels": min(channels, 6),
+            "source_profile": primary.get("profile"),
         })
-        a.notes.append(f"{codec} {channels}ch transcoded to E-AC3 640k")
+        a.notes.append(
+            f"{codec} {channels}ch is lossless ({lossless_reason(primary)}); "
+            "transcoded to E-AC3 640k")
     else:
         a.audio.append({
             "role": "surround", "source_index": idx, "codec": "copy",
+            "source_profile": primary.get("profile"),
         })
+        profile = primary.get("profile")
+        a.notes.append(
+            f"{codec} {channels}ch is lossy"
+            + (f" (profile {profile})" if profile else "")
+            + "; copied rather than re-encoded")
 
 
 def resolve_subtitles(a: Analysis, streams: list[dict]) -> None:
@@ -582,7 +648,9 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
     # Only pay for the IVTC probe when combing suggests it is relevant.
     total = inter + prog
     if total and inter / total > 0.10:
-        a.ivtc_fps = decoded_fps(path, mid)
+        # NB: measure the IVTC'd rate only. An earlier version also called
+        # decoded_fps() here and then threw the answer away one line later,
+        # paying for a 20s decode per combed file for nothing.
         cp = run([
             "ffmpeg", "-nostdin", "-v", "quiet", "-ss", str(mid), "-t", "20",
             "-i", str(path), "-vf", "fieldmatch,decimate", "-an",
@@ -602,6 +670,8 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
     resolve_crop(a, width, height)
 
     a.analyzer = analyzer_fingerprint()
+    a.ffmpeg_version = ffmpeg_version()
+    a.x265_version = x265_version()
     resolve_color(a, v, height)
     resolve_audio(a, streams)
     resolve_subtitles(a, streams)
@@ -645,6 +715,42 @@ def analyzer_fingerprint() -> str:
     try:
         return hashlib.sha256(
             pathlib.Path(__file__).read_bytes()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def ffmpeg_version() -> str:
+    """Version string of the ffmpeg actually on PATH.
+
+    Worth recording because several of this pipeline's rules are
+    ffmpeg-version-specific. Measured: the colour-in-x265-params requirement
+    (cardinal rule 2) does not reproduce on ffmpeg 6.1.1 but does on 8.1+,
+    so an encode's provenance is incomplete without knowing which built it.
+    """
+    try:
+        cp = run(["ffmpeg", "-version"], timeout=15)
+        first = cp.stdout.splitlines()[0] if cp.stdout else ""
+        parts = first.split()
+        return parts[2] if len(parts) > 2 else "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+@functools.lru_cache(maxsize=1)
+def x265_version() -> str:
+    """libx265 version, via a throwaway 64x64 encode.
+
+    x265 stamps this into an SEI in every output too, but that costs a
+    bitstream extraction to read back (and note rule 3: strings truncates it).
+    A container-level tag is far cheaper to query across a library.
+    """
+    try:
+        cp = run(["ffmpeg", "-hide_banner", "-f", "lavfi",
+                  "-i", "testsrc=d=0.1:s=64x64", "-c:v", "libx265",
+                  "-f", "null", "-"], timeout=60)
+        m = re.search(r"HEVC encoder version ([0-9A-Za-z.+~_-]+)", cp.stderr)
+        return m.group(1) if m else "unknown"
     except Exception:  # noqa: BLE001
         return "unknown"
 

@@ -101,6 +101,8 @@ success. A killed encode can never leave something a later run mistakes for fini
 - `--remap OLD=NEW` rewrite source path prefixes (only needed if the plan was written on
   another machine)
 - `--ignore-stale` run plans that predate the current `analyze.py`
+- `--jobs N` encode N titles concurrently (default 1). At 480p one encode cannot
+  saturate many cores, so 2–4 beats one wide encode; past ~4 you contend on NAS reads
 
 Refuses stale plans, skips `needs_review`, and will not overwrite without `--replace`.
 
@@ -111,8 +113,15 @@ python3 cintel verify PLANS... --out DIR [--sample] [--vmaf]
 ```
 
 Checks output against its plan: framerate matches the cadence decision, duplicate frames
-relative to the **source**, duration within 1%, dimensions match the planned crop, colour tags
-present and correct, audio track count as planned.
+relative to the **source**, A/V drift relative to the **source**, duration within 1%,
+dimensions match the planned crop, colour tags present and correct, audio track count as
+planned.
+
+A/V sync is measured as drift — how far audio and video pull apart between the start and end
+of the file — and compared against the source, because discs carry real authored offsets that
+should be preserved. Sampled encodes use a video/audio timespan ratio instead, since the
+input seek that makes a sample offsets the first video PTS and would otherwise read as
+desync.
 
 `--sample` skips the duration check for deliberately-short sample encodes. `--vmaf` is slow
 and off by default; it upscales SD to 1080p first, since the default VMAF model is invalid at
@@ -173,6 +182,9 @@ Each cost real debugging time and is commented where it matters:
 - ffmpeg reads stdin and will consume a caller's input loop — always `-nostdin`.
 - `idet` logs at INFO level, so `-v quiet` silently discards its output.
 - `-af:a:0` parses but applies to *every* audio stream. Use `-filter:a:0`.
+- `codec_name` is `dts` for both lossy DTS and lossless DTS-HD MA; only `profile`
+  tells them apart, so "is it lossless" cannot be a codec-name lookup.
+- The colour-tag bug (above) does not reproduce on ffmpeg 6.1.1, only on 8.1+.
 - macOS writes `._*` AppleDouble sidecars on SMB shares; they match media
   extensions but are not media.
 - BSD `xargs` has neither `-a` nor `-d`.

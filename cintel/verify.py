@@ -37,6 +37,8 @@ FPS_TOL = 0.15        # absolute fps
 DURATION_TOL = 0.01   # fraction
 DUPLICATE_TOL = 0.02             # output ratio that triggers a source comparison
 DUPLICATE_INTRODUCED_TOL = 0.05  # how much more than the source is a failure
+SYNC_TOL = 0.100                 # seconds of A/V drift we are willing to introduce
+SPAN_RATIO_TOL = 0.02            # video/audio span may differ by this fraction
 SAMPLE_SECONDS = 30
 
 _FRAME_RE = re.compile(r"frame=\s*(\d+)")
@@ -100,6 +102,83 @@ def duplicate_ratio(path: Path, start: int,
     if not b or not d or int(b[-1]) == 0:
         return None
     return (int(b[-1]) - int(d[-1])) / int(b[-1])
+
+
+def _pts_bounds(path: Path, stream: str) -> tuple[float | None, float | None]:
+    """First and last presentation timestamp of a stream, cheaply.
+
+    Reads a few packets at the head and, via -read_intervals, a burst at 99%
+    rather than demuxing the whole file. Packets arrive in decode order, so
+    min/max is taken rather than first/last - with B-frames the largest PTS is
+    not the last packet.
+    """
+    def vals(cp: subprocess.CompletedProcess) -> list[float]:
+        out = []
+        for line in cp.stdout.splitlines():
+            try:
+                out.append(float(line.strip().rstrip(",")))
+            except ValueError:
+                pass
+        return out
+
+    head = run(["ffprobe", "-v", "error", "-select_streams", stream,
+                "-read_intervals", "%+#40", "-show_entries", "packet=pts_time",
+                "-of", "csv=p=0", str(path)])
+    tail = run(["ffprobe", "-v", "error", "-select_streams", stream,
+                "-read_intervals", "99%+#99999",
+                "-show_entries", "packet=pts_time",
+                "-of", "csv=p=0", str(path)])
+    h, t = vals(head), vals(tail)
+    return (min(h) if h else None, max(t) if t else None)
+
+
+def av_drift(path: Path) -> float | None:
+    """How far audio and video pull apart across a file, in seconds.
+
+    Computed as (audio-video skew at the end) minus (the same skew at the
+    start), so a constant offset cancels and only ACCUMULATING desync is
+    reported. That is the distinction that matters: discs are authored with
+    small fixed offsets and MakeMKV preserves them faithfully, whereas drift
+    that grows over the runtime means a frame-rate or cadence assumption is
+    wrong somewhere.
+
+    Only valid on a file that was NOT produced with an input seek - see
+    av_span_ratio for why, and use that one for samples.
+
+    Returns None when there is no audio stream, or timestamps are unreadable.
+    """
+    v_start, v_end = _pts_bounds(path, "v:0")
+    a_start, a_end = _pts_bounds(path, "a:0")
+    if None in (v_start, v_end, a_start, a_end):
+        return None
+    return (a_end - v_end) - (a_start - v_start)
+
+
+def av_span_ratio(path: Path) -> float | None:
+    """Video timespan divided by audio timespan. 1.0 means they cover the
+    same stretch of time; below 1.0 the video is short against its audio.
+
+    Needed because av_drift is not usable on a sampled encode. An input seek
+    lands on the first decodable frame after the seek point, so the video's
+    first PTS can sit several hundred ms after the audio's - measured at
+    416ms on a real test clip. av_drift reads that head offset as drift and
+    fails a perfectly good sample. This is the same trap as bug 8.
+
+    A ratio ignores the head offset entirely and measures the thing that
+    actually goes wrong: video running short against audio that was copied
+    untouched. Measured on a deliberately mis-encoded clip - decimate applied
+    to already-progressive 23.976 content - the ratio was 0.797, i.e. exactly
+    the 4/5 that dropping one frame in five produces, against 0.996 for the
+    correct encode of the same source.
+    """
+    v_start, v_end = _pts_bounds(path, "v:0")
+    a_start, a_end = _pts_bounds(path, "a:0")
+    if None in (v_start, v_end, a_start, a_end):
+        return None
+    a_span = a_end - a_start
+    if a_span <= 0:
+        return None
+    return (v_end - v_start) / a_span
 
 
 def expected_fps(plan: dict) -> float | None:
@@ -201,6 +280,42 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
             problems.append(
                 f"duplicate frames {dup*100:.1f}% vs source "
                 f"{src_dup*100:.1f}% - {(dup - src_dup)*100:.1f}% introduced")
+
+    # --- A/V sync -----------------------------------------------------------
+    # Like the duplicate check, the question is whether WE introduced desync,
+    # not whether any exists. A DVD rip can carry a small authored offset that
+    # is entirely correct to preserve. So the output's drift is compared
+    # against the source's, and only the difference is a failure.
+    #
+    # This is the check that catches a wrong cadence filter end-to-end:
+    # decimating already-progressive 23.976 content drops one real frame in
+    # five, so the video runs short against an audio track that was copied
+    # untouched, and the gap grows all the way through the file.
+    if sample:
+        # A sampled encode is cut with an input seek, which offsets the
+        # video's first PTS from the audio's and makes av_drift meaningless.
+        # The span ratio is immune to that.
+        ratio = av_span_ratio(dst)
+        if ratio is not None and abs(1.0 - ratio) > SPAN_RATIO_TOL:
+            problems.append(
+                f"video covers {ratio*100:.1f}% of the audio timespan "
+                "- video is running short against its audio")
+        drift_out = None
+    else:
+        drift_out = av_drift(dst)
+    if drift_out is None:
+        pass  # sample (handled above), no audio, or unreadable timestamps
+    elif src.exists():
+        drift_src = av_drift(src)
+        if drift_src is None:
+            problems.append(
+                f"A/V drift {drift_out*1000:+.0f}ms and source unavailable "
+                "for comparison")
+        elif abs(drift_out - drift_src) > SYNC_TOL:
+            problems.append(
+                f"A/V drift {drift_out*1000:+.0f}ms vs source "
+                f"{drift_src*1000:+.0f}ms - "
+                f"{(drift_out - drift_src)*1000:+.0f}ms introduced")
 
     # --- dimensions ---------------------------------------------------------
     if plan.get("crop"):
