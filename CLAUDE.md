@@ -188,13 +188,14 @@ much a title is worth to its owner, which nothing can measure.
   **bt709 transfer on SD content**. Both corrected.
 - Buffy: 63 of 143 episodes deinterlaced, 80 passed through clean. Enabled after the owner
   compared a repaired episode against an unrepaired one by eye.
-- **14 bugs found and fixed, all by measurement.** Bugs 12-14 were *measurement* defects,
+- **15 bugs found and fixed, all by measurement.** Bugs 12-15 were *measurement* defects,
   not encode defects — see `docs/handoff.md` §5.
 - Throughput measured: **5.08 min** per 43.5-min DVD episode at `--jobs 3`; **4.78 min** for
   Buffy unfiltered, **6.15 min** with the deint chain.
 - Blu-ray tiers split and each CRF measured against a lossless FFV1 reference (§3.6a).
 
-**In flight:** Hot Fuzz at `slow` CRF 19 — first end-to-end run of the `bluray-film` tier.
+- `bluray-film` validated end to end: Hot Fuzz, **4h55m at 0.41x realtime**, 12.16 GB from
+  30.7 GB, verified. Tier projects to ~78 h for all 14 films.
 
 **Next** (detail in `docs/handoff.md` §7.1):
 

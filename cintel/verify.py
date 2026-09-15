@@ -405,9 +405,23 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
     elif src.exists():
         drift_src = av_drift(src)
         if drift_src is None:
-            problems.append(
-                f"A/V drift {drift_out*1000:+.0f}ms and source unavailable "
-                "for comparison")
+            # The source could not be measured - on a very large Matroska the
+            # audio tail probe hits PTS_PROBE_TIMEOUT (measured: every Blu-ray
+            # film here, sources 20-60GB). Comparing against the source is the
+            # better test, but its absence is not evidence of a fault: fall
+            # back to an absolute bound. Drift under SYNC_TOL is inaudible
+            # whether we introduced it or inherited it.
+            #
+            # The gap this leaves: a source carrying a large AUTHORED offset
+            # would be reported here even though the encode is faithful. That
+            # is the honest failure mode - it says "could not compare", not
+            # "the encode is broken".
+            if abs(drift_out) <= SYNC_TOL:
+                pass
+            else:
+                problems.append(
+                    f"A/V drift {drift_out*1000:+.0f}ms exceeds {SYNC_TOL*1000:.0f}ms "
+                    "and the source could not be measured for comparison")
         elif abs(drift_out - drift_src) > SYNC_TOL:
             problems.append(
                 f"A/V drift {drift_out*1000:+.0f}ms vs source "

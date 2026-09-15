@@ -739,6 +739,7 @@ All were found by measurement. None by reasoning.
 | 12 | Combing sampled from ONE window per title | 123 of 143 Buffy episodes classified `film` (clean) when 58 were combed. One window read 3.2% where nine read 42.2% |
 | 13 | The `film` verdict never read the combing measurement | Rate alone decided it, so soft-telecined episodes at 44-58% combed were declared clean and shipped unrepaired |
 | 14 | Framerate asserted against a constant with no source fallback | 5 faithful, unfiltered Buffy encodes failed verify for tracking sources that are not uniformly 23.976 |
+| 15 | A/V drift check failed when the SOURCE could not be measured | Would have failed all 14 Blu-ray films: sources are 20-60GB, the audio tail probe times out, and "no reference" was treated as a fault. Hot Fuzz failed at +62ms against a 100ms tolerance |
 
 ### 5.1 Bug 7 in detail — the one to understand
 
@@ -804,8 +805,18 @@ movie, a Blu-ray, an untested show and a degenerate-sub file, and Office dropped
 | Charmed | 173 | 63 GB | 132 GB | fixed 25.833fps timing + bt709 transfer on SD |
 | Buffy | 143 | 47 GB | 136 GB | 63 episodes deinterlaced, 80 clean |
 
-**In flight:** Hot Fuzz at `slow` CRF 19, the first end-to-end run of the `bluray-film`
-tier. Validates the lossless-audio path (DTS-HD MA -> E-AC3 640k) at full length.
+**`bluray-film` validated end to end (2026-09-15).** Hot Fuzz at `slow` CRF 19:
+
+| | |
+|---|---|
+| Encode | **4h55m**, 0.41x realtime, solo at `--jobs 1` |
+| Output | 12.16 GB from a 30.7 GB source |
+| Streams | hevc Main 10 1920x814 bt709, ac3 2ch copied, **eac3 6ch from DTS-HD MA**, 1 eng PGS |
+| Verify | PASS (after bug 15) |
+
+This is the first full-length exercise of the lossless-audio transcode, which is the one
+irreversible decision in the pipeline. Projected for the tier: **~78 hours** for all 14
+films' 32 hours of content, so ~73 hours for the remaining 13. Kill Bill is ~9.4 h of that.
 
 **Next, in order of value**
 
@@ -1016,7 +1027,7 @@ toolchain     ffmpeg n9.0.1 / x265 4.2 (static, /usr/local/bin) - NOT apt's 6.1.
 
 1. **Decide from the file, not from a label.** Every defect in the old library traced to a
    human-supplied profile being applied to content it didn't fit.
-2. **Measure; do not reason.** Fourteen bugs, all found by measurement. Two independent AI models
+2. **Measure; do not reason.** Fifteen bugs, all found by measurement. Two independent AI models
    reasoned their way to a filter chain that would have destroyed the library.
 3. **Verify against an explicit plan.** This is what makes the whole approach viable — it
    turns silent corruption into a loud failure.
