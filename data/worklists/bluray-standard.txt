@@ -1,0 +1,30 @@
+# Blu-ray films that get the STANDARD tier rather than the careful one.
+#
+# This is a preference, not a measurement - it records which titles their owner
+# wants the machine to spend hours on, which nothing in the file can tell you.
+# Deliberate exception to principle 1, same as the film/tv split; analyze.py
+# records in each plan which list decided the tier, so it stays auditable.
+#
+# One source stem per line (the filename without .mkv). Case-insensitive.
+# Anything NOT listed here falls to bluray-film, the careful side - because
+# overspending on a film is recoverable and under-spending on a favourite is
+# the failure that matters (rule 9).
+
+# --- Fast & Furious (10) ---
+2 Fast 2 Furious (2003)
+F9 (2021)
+Fast and Furious (2009)
+Fast and Furious 6
+Fast Five (2011)
+Fast X (2023)
+Furious 7 (2015)
+The Fast and the Furious (2001)
+The Fast and the Furious - Tokyo Drift (2006)
+The Fate of the Furious (2017)
+
+# --- Hunger Games (5) ---
+The Hunger Games (2012)
+The Hunger Games- Catching Fire (2013)
+The Hunger Games- Mockingjay - Part 1 (2014)
+The Hunger Games- Mockingjay - Part 2 (2015)
+The Hunger Games- The Ballad Of Songbirds And Snakes

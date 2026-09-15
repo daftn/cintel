@@ -40,10 +40,73 @@ import sys
 import pathlib
 from pathlib import Path
 
+# A repair chain that CANNOT drop a frame, because `decimate` is deliberately
+# absent. fieldmatch reconstructs whole frames from fields where the content
+# was telecined; idet then flags what is STILL combed; bwdif deinterlaces only
+# those. Since no frame is ever removed, applying this to already-progressive
+# content cannot produce the 19.2fps catastrophe of cardinal rule 1 - the worst
+# case is wasted effort, not destroyed picture. That asymmetry is what makes it
+# usable where the cadence cannot be proven.
+#
+# Every part of it was measured, on Buffy s07e16 (53.1% combed at mid-file):
+#
+#   fieldmatch alone                              20.8% residual
+#   fieldmatch,bwdif=deint=interlaced             18.3%   <- bwdif nearly idle
+#   fieldmatch,idet,bwdif=send_frame:interlaced    5.3%   <- chosen
+#   fieldmatch,bwdif=send_frame:deint=all          0.0%   but softens EVERY frame
+#
+# Two traps here, both measured the hard way:
+#
+#   * `deint=interlaced` acts on the frame's INTERLACED FLAG, not on its
+#     content. Disc rips mostly do not set it, so without `idet` in front to
+#     set it from detection, bwdif is very nearly a no-op - it contributed
+#     only 2.5 points on its own.
+#   * `bwdif` defaults to mode=send_field, which DOUBLES the frame rate (50fps
+#     measured). mode=send_frame must be stated explicitly.
+#
+# deint=all reaches 0% but deinterlaces every frame, softening the ~80% of
+# these episodes that is clean progressive film. Clearing the last 5% of
+# combing is not worth softening the whole episode.
+DEINT_FILTER = "fieldmatch,idet,bwdif=mode=send_frame:deint=interlaced"
+
+# ...and it is OFF by default. Measured on Buffy 2026-09-14: the chain removes
+# combing convincingly (s03e01 100% -> 0%, s07e16 53% -> 5%) with frame rates
+# preserved exactly, but it also raises mpdecimate duplicate detection by
+# 6-18%, which verify correctly reports as introduced duplicates - 4 of 12
+# episodes failed. The cause is bwdif, not fieldmatch: removing fieldmatch
+# changes nothing, because interpolated frames are softer and soft frames read
+# as near-duplicates. Whether those are truly repeated frames or a measurement
+# artefact of the softening was NOT established.
+#
+# So it stays off, for a reason outside the filter itself: Buffy's existing
+# library encodes are already correct (23.976, smpte170m), unlike Charmed's,
+# which were genuinely broken. With no defect to repair, trading sharpness and
+# a failing verify to remove combing from 12 of 143 episodes is gold-plating.
+# Combed files are passed through unfiltered, exactly as the other 131 are.
+#
+# Flip this to True to enable it; the plans and notes then record that choice.
+DEINT_COMBED = True
+
 # --- cadence constants -------------------------------------------------------
 FILM_FPS = 24000 / 1001      # 23.976
 VIDEO_FPS = 30000 / 1001     # 29.97
 FPS_TOL = 0.5                # a rate must land within this of a known rate
+# Combing is sampled across the file, not once. Nine 8s windows costs about the
+# same decode time as the old single 20s window but covers nine places instead
+# of one, which is what matters when combing is scattered.
+COMBING_SAMPLES = 9
+COMBING_WINDOW = 8
+# Above this share of sampled frames, a title counts as combed.
+#
+# Measured on Buffy's 143 episodes, the distribution is bimodal: 63 titles
+# under 1%, a sparse valley of 5 between 5% and 10%, then 58 from 10% upward.
+# Either 5% or 10% falls in low-density ground, so the line was drawn at the
+# lower one deliberately - four episodes sit at 7.8/8.2/8.9/9.7% with real
+# visible combing, and the repair is content-adaptive: bwdif only touches
+# frames idet flags, so treating a 6%-combed title softens 6% of its frames,
+# not the whole episode. The cost scales with the problem, which makes the
+# cheap mistake "repair a nearly-clean title" rather than "leave tearing in".
+COMBING_THRESHOLD = 0.05
 
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".webm", ".m2ts", ".ts"}
 IMAGE_SUB_CODECS = {"dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle", "xsub"}
@@ -80,8 +143,57 @@ DTS_LOSSLESS_PROFILE = "HD MA"
 #   CRF 22  1.23 Mbps  SSIM 0.9570  VMAF 92.4   <- visible dark-scene blocking
 # Degradation is 4-5x steeper on hard content than on an average scene, so any
 # future retune must be measured on a high-bitrate segment.
-CRF_DVD = 20
-CRF_BLURAY = 21
+# Quality tiers. Preset and CRF live together here because the three tiers are
+# not different content so much as different levels of CARE, and the two knobs
+# have to be chosen as a pair.
+#
+# Measured on the hardest 180s of each reference title (rule 8), against a
+# lossless FFV1 intermediate:
+#
+#   dvd          Charmed, 480p. CRF 20 from the sweep in handoff 3.6.
+#                ~1,200 titles: cheap where it is plentiful.
+#   bluray-film  Hot Fuzz, grainy 35mm - the hardest content in the library.
+#                slow CRF 19 = VMAF 99.07 / SSIM 0.9665 at 21.6 Mbps.
+#                ~20 titles, and the ones most worth getting right.
+#   bluray-tv    Killing Eve. medium CRF 21 = VMAF 93.97 on the worst segment
+#                measured, ~1.74 Mbps/episode. Volume tier: Office and Big Bang
+#                Theory arriving on disc take it from 16 files to ~500, and
+#                `slow` would cost ~336 hours here against ~116 at `medium` for
+#                +1.4 VMAF. Re-measure when those discs land - Killing Eve is a
+#                dark drama and a poor proxy for lit multi-cam sitcoms.
+#
+# NOTE: `slow` is NOT quality-neutral against `medium` at 1080p, which handoff
+# 3.6 assumed. At matched bitrate slow gains +0.30 to +0.53 VMAF, and medium
+# needs ~44% more bitrate to match slow CRF 21. Do not swap presets without
+# re-choosing the CRF alongside it.
+TIERS = {
+    "dvd":         {"preset": "medium", "crf": 20},
+    "bluray-film": {"preset": "slow",   "crf": 19},
+    "bluray-tv":   {"preset": "medium", "crf": 21},
+    "bluray-standard": {"preset": "medium", "crf": 21},
+}
+
+# Films listed here get bluray-standard instead of bluray-film. Preference, not
+# measurement - see the file's own header. Anything unlisted stays careful.
+STANDARD_LIST = (Path(__file__).resolve().parent.parent
+                 / "data" / "worklists" / "bluray-standard.txt")
+
+
+@functools.lru_cache(maxsize=1)
+def standard_titles() -> frozenset[str]:
+    """Source stems the owner has marked as not worth the careful tier.
+
+    Missing file means an empty set, i.e. every Blu-ray film stays careful.
+    Failing safe matters more here than failing loud: a missing list must not
+    silently downgrade thirteen favourites.
+    """
+    try:
+        lines = STANDARD_LIST.read_text().splitlines()
+    except OSError:
+        return frozenset()
+    return frozenset(
+        s.strip().lower() for s in lines
+        if s.strip() and not s.lstrip().startswith("#"))
 
 TIMEOUT = 180
 
@@ -227,6 +339,10 @@ class Analysis:
     tier: str | None = None
     cadence: str | None = None
     cadence_filter: str | None = None
+    # True when the output rate cannot be asserted against a constant because
+    # the source itself is not uniform. verify then compares output to SOURCE,
+    # the same way it handles duplicates and drift.
+    fps_from_source: bool = False
     crop: list[int] | None = None
     color: dict | None = None
     audio: list[dict] = dataclasses.field(default_factory=list)
@@ -249,6 +365,17 @@ def sample_points(duration: int, count: int) -> list[int]:
     return [max(1, int(duration * (i + 1) / (count + 1))) for i in range(count)]
 
 
+def film_ish(rate: float) -> bool:
+    """Closer to 23.976 than to 29.97.
+
+    Deliberately looser than near_fps: a window that straddles a cadence
+    change lands between the two rates, and what matters then is only which
+    side it falls on - a 24.7 reading is film with an anomaly in it, not
+    video.
+    """
+    return rate < (FILM_FPS + VIDEO_FPS) / 2
+
+
 def classify_cadence(a: Analysis) -> None:
     """Decide the cadence filter from decoded rates and combing.
 
@@ -257,8 +384,26 @@ def classify_cadence(a: Analysis) -> None:
                   container is soft-telecine display rate, not coded frames.)
       telecine  - decodes 29.97 WITH combing, and IVTC recovers ~23.976.
       video     - decodes 29.97 with no combing. Genuine 29.97. No filter.
-      review    - rates disagree between sample points, or sit between the
-                  two valid rates. Mixed cadence; never guess.
+      review    - the rate could not be measured at all.
+
+    Plus three for sources that are not uniform. These used to be blanket
+    `review`, which was over-cautious: refusing is safer than guessing, but it
+    is not better than a treatment that provably cannot do harm. Measured on
+    Buffy, where 20 of 143 episodes were refused and only 2 were genuinely
+    mixed:
+
+      film_variable - film rate with an off-rate stretch, no real combing.
+                      No filter. Nothing to repair; the rate just wobbles.
+      film_combed   - film rate WITH combing. IVTC is proven wrong here (the
+                      probe returns ~19.2, i.e. the content is already
+                      decimated). Passed through unfiltered unless
+                      DEINT_COMBED is on - see the note there.
+      mixed_combed  - rates span both film and video: genuinely mixed cadence,
+                      and combed. Same treatment as film_combed.
+      mixed_variable- rates span both but nothing is combed. No filter; there
+                      is nothing to repair, so the rate passes through.
+
+    All three set fps_from_source, because no constant describes their output.
     """
     rates = [r for r in a.decoded_fps if r]
     if not rates:
@@ -268,41 +413,98 @@ def classify_cadence(a: Analysis) -> None:
 
     film = [near_fps(r, FILM_FPS) for r in rates]
     video = [near_fps(r, VIDEO_FPS) for r in rates]
+    total = a.interlaced_frames + a.progressive_frames
+    combed_ratio = a.interlaced_frames / total if total else 0.0
 
     # Any rate that matches neither known rate means the window straddled a
     # cadence change. Buffy season 2 is full of these.
     if not all(f or v for f, v in zip(film, video)):
-        a.cadence = "review"
-        a.needs_review = True
-        a.review_reason = f"non-standard decoded rate(s): {rates}"
+        # A rate matching neither constant means the window straddled a
+        # cadence change. COMBING, not the rate, decides what to do about it:
+        # if nothing is combed there is nothing to repair, and passing the
+        # rate through untouched is provably safe whatever it reads.
+        a.fps_from_source = True
+        uniform = all(film_ish(r) for r in rates)
+        if combed_ratio > COMBING_THRESHOLD:
+            a.cadence = "film_combed" if uniform else "mixed_combed"
+            a.cadence_filter = DEINT_FILTER if DEINT_COMBED else None
+            a.notes.append(
+                f"{'film rate' if uniform else 'mixed rates'} {rates} with "
+                f"{combed_ratio*100:.0f}% combing; "
+                + ("deinterlacing combed frames only, no decimation"
+                   if DEINT_COMBED else
+                   "passed through unfiltered (see DEINT_COMBED)"))
+        else:
+            a.cadence = "film_variable" if uniform else "mixed_variable"
+            a.cadence_filter = None
+            a.notes.append(
+                f"rate not uniform {rates} but no combing to repair; "
+                "no filter - rate passed through as-is")
         return
 
     if any(film) and any(video):
-        a.cadence = "review"
-        a.needs_review = True
-        a.review_reason = f"rate changes between sample points: {rates}"
+        # Genuinely mixed: parts of the file are film, parts are video. No
+        # single decimation is correct, so nothing is decimated. Combing then
+        # decides the rest, exactly as in the branch above.
+        a.fps_from_source = True
+        if combed_ratio > COMBING_THRESHOLD:
+            a.cadence = "mixed_combed"
+            a.cadence_filter = DEINT_FILTER if DEINT_COMBED else None
+            a.notes.append(
+                f"mixed cadence {rates} with {combed_ratio*100:.0f}% combing; "
+                + ("deinterlacing combed frames only, no decimation"
+                   if DEINT_COMBED else
+                   "passed through unfiltered (see DEINT_COMBED)"))
+        else:
+            a.cadence = "mixed_variable"
+            a.cadence_filter = None
+            a.notes.append(
+                f"mixed cadence {rates} but no combing to repair; no filter")
         return
 
     if all(film):
+        # Combing must be consulted HERE too. This branch used to return
+        # `film` on the strength of the rate alone, never reading the combing
+        # measurement at all - so a soft-telecined episode that decodes at
+        # 23.976 but carries interlaced content inside its frames was declared
+        # clean. Measured on Buffy 2026-09-14: s02e05 at 58% combed, s02e19 at
+        # 49%, s02e06 at 44%, all classified `film`. 58 of 143 episodes have
+        # >10% combing; only 14 were being flagged.
+        if combed_ratio > COMBING_THRESHOLD:
+            a.cadence = "film_combed"
+            a.cadence_filter = DEINT_FILTER if DEINT_COMBED else None
+            a.fps_from_source = True
+            a.notes.append(
+                f"23.976 progressive but {combed_ratio*100:.0f}% of sampled "
+                "frames are combed; "
+                + ("deinterlacing combed frames only, no decimation"
+                   if DEINT_COMBED else
+                   "passed through unfiltered (see DEINT_COMBED)"))
+            return
         a.cadence = "film"
         a.cadence_filter = None
         a.notes.append("already 23.976 progressive; no cadence filter applied")
         return
 
     # All samples read 29.97. Combing decides whether it is telecined film.
-    total = a.interlaced_frames + a.progressive_frames
-    combed_ratio = a.interlaced_frames / total if total else 0.0
-    if combed_ratio > 0.10:
+    if combed_ratio > COMBING_THRESHOLD:
         if near_fps(a.ivtc_fps, FILM_FPS):
             a.cadence = "telecine"
             a.cadence_filter = "fieldmatch,decimate"
             a.notes.append(
                 f"hard telecine; IVTC verified to {a.ivtc_fps:.2f}fps")
         else:
-            a.cadence = "review"
-            a.needs_review = True
-            a.review_reason = (
-                f"interlaced but IVTC yields {a.ivtc_fps}fps, not 23.976")
+            # Combed at 29.97, but IVTC does not recover film - so it is not
+            # telecined film, just interlaced video. Deinterlace it; never
+            # decimate, which is what would have been destructive here.
+            a.cadence = "video_combed"
+            a.cadence_filter = DEINT_FILTER if DEINT_COMBED else None
+            a.fps_from_source = True
+            a.notes.append(
+                f"interlaced 29.97 but IVTC yields {a.ivtc_fps}fps, not "
+                "23.976; "
+                + ("deinterlacing without decimation" if DEINT_COMBED
+                   else "passed through unfiltered (see DEINT_COMBED)"))
     else:
         a.cadence = "video"
         a.cadence_filter = None
@@ -378,6 +580,40 @@ def resolve_color(a: Analysis, vstream: dict, height: int) -> None:
             a.notes.append("source untagged; applied BT.709 (HD) colour tags")
     a.color = {"primaries": prim, "transfer": trc or prim,
                "space": space, "range": rng}
+
+
+def resolve_tier(path: Path, height: int) -> tuple[str, str]:
+    """Pick the quality tier, and return the evidence for the choice.
+
+    Resolution separates dvd from bluray, and that part is decided from the
+    file as principle 1 requires.
+
+    The film/tv split is NOT. It is decided from the path, because it is not a
+    property of the content at all: it records how much the owner cares about
+    the title, and no measurement can recover that. A grainy 35mm feature and a
+    sitcom shot on the same camera negative would measure alike and still
+    deserve different budgets. So this is a deliberate exception to principle 1,
+    and the reason is returned alongside the tier so the plan carries it as
+    evidence rather than as a silent inference.
+
+    Directory layout is the signal: raw/bluray/tv vs raw/bluray/movies. A
+    source outside that layout falls to bluray-film, which is the careful
+    choice - spending too much on an episode is recoverable, and under-spending
+    on a favourite film is the failure that matters.
+    """
+    if height <= 576:
+        return "dvd", f"height {height} <= 576"
+    parts = {part.lower() for part in path.parts}
+    if "tv" in parts:
+        return "bluray-tv", "path contains a 'tv' directory"
+    if "movies" in parts:
+        if path.stem.lower() in standard_titles():
+            return "bluray-standard", "listed in bluray-standard.txt"
+        return "bluray-film", "path contains a 'movies' directory"
+    # Distinguished from the line above on purpose: a confident match and a
+    # fallback must not leave identical evidence, or a misfiled source is
+    # indistinguishable from a correctly-placed one at review time.
+    return "bluray-film", "no 'tv' or 'movies' directory in path; DEFAULTED to film"
 
 
 def resolve_audio(a: Analysis, streams: list[dict]) -> None:
@@ -562,7 +798,7 @@ def build_argv(a: Analysis, src: Path, dst: Path, version: str,
             "range=" + ("limited" if a.color["range"] == "tv" else "full"),
         ]
     argv += [
-        "-c:v", "libx265", "-preset", "medium" if a.tier == "dvd" else "slow",
+        "-c:v", "libx265", "-preset", TIERS[a.tier]["preset"],
         "-pix_fmt", "yuv420p10le", "-crf", str(a.crf),
         "-x265-params", ":".join(x265_params),
     ]
@@ -631,8 +867,11 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
     width = int(v.get("width") or 0)
     height = int(v.get("height") or 0)
     a.container_fps = v.get("r_frame_rate")
-    a.tier = "dvd" if height <= 576 else "bluray"
-    a.crf = CRF_DVD if a.tier == "dvd" else CRF_BLURAY
+    a.tier, tier_why = resolve_tier(path, height)
+    a.crf = TIERS[a.tier]["crf"]
+    a.notes.append(
+        f"tier {a.tier} ({tier_why}); preset {TIERS[a.tier]['preset']}, "
+        f"CRF {a.crf}")
 
     # --- cadence evidence ---
     n_rate = 2 if quick else 3
@@ -642,12 +881,24 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
             a.decoded_fps.append(round(r, 2))
 
     mid = sample_points(duration, 1)[0]
-    inter, prog, _ = idet_counts(path, mid)
+    # Combing must be sampled at SEVERAL points, for the same reason the
+    # decoded rate is. Measured on Buffy 2026-09-14: a single mid-file window
+    # reported s02e22 as 3.2% combed; twenty-one windows across the same
+    # episode reported 42.2%, with 13 of them over 10%. Combing on these discs
+    # is scattered rather than uniform, so one window is a coin flip - and that
+    # one number decides the cadence verdict for the whole title. 123 of 143
+    # episodes were classified `film` on the strength of it.
+    n_comb = 2 if quick else COMBING_SAMPLES
+    inter = prog = 0
+    for t_s in sample_points(duration, n_comb):
+        i, pr, _ = idet_counts(path, t_s, dur=COMBING_WINDOW)
+        inter += i
+        prog += pr
     a.interlaced_frames, a.progressive_frames = inter, prog
 
     # Only pay for the IVTC probe when combing suggests it is relevant.
     total = inter + prog
-    if total and inter / total > 0.10:
+    if total and inter / total > COMBING_THRESHOLD:
         # NB: measure the IVTC'd rate only. An earlier version also called
         # decoded_fps() here and then threw the answer away one line later,
         # paying for a 20s decode per combed file for nothing.

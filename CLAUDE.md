@@ -51,9 +51,10 @@ These are not style preferences. Each one was learned by breaking something.
    are permanent. Subtitle selection and CRF are not. Sources are archived in
    `raw/` — re-encoding is always available, so never gamble on an irreversible operation.
 
-10. **When a plan and reality disagree, suspect the checker.** Four of the last five bugs were
-    in `verify.py`, not in the encodes. A verify failure means *investigate*, not *the encode
-    is broken*.
+10. **When a plan and reality disagree, suspect the checker.** Eight of the last nine bugs
+    were in `verify.py` or in what `analyze` measured, not in the encodes. A verify failure means *investigate*, not *the encode
+    is broken*. Most recently: a drift check reporting −970 *seconds* on a file that was
+    fine. If a measurement is absurd on its face, measure the measurement.
 
 ---
 
@@ -149,8 +150,9 @@ percent throughput.
 ## Current configuration
 
 ```
-DVD tier      preset medium, CRF 20, BT.601 tags
-Blu-ray tier  preset slow,   CRF 21, BT.709 tags
+dvd tier          preset medium, CRF 20, BT.601 tags
+bluray-film tier  preset slow,   CRF 19, BT.709 tags  (~20 movies)
+bluray-tv tier    preset medium, CRF 21, BT.709 tags  (~500 eps once Office/BBT land)
 cadence       measured per file: none / fieldmatch,decimate / needs_review
 crop          cropdetect x10, 20th-percentile margin, 8px width floor
 audio         copy where possible; lossless surround -> E-AC3 640k, 5.1 max; English only
@@ -161,47 +163,55 @@ toolchain     ffmpeg n9.0.1 / x265 4.2, static build in /usr/local/bin (not apt'
 ```
 
 Preset assignment is deliberately "cheap where it is plentiful, careful where it is rare":
-~1,200 DVD titles get `medium`, ~36 Blu-rays get `slow`.
+~1,200 DVD titles get `medium`, ~20 Blu-ray films get `slow`. Blu-ray **TV** gets `medium`
+too — Office and Big Bang Theory arriving on disc take that tier from 16 files to ~500, so
+Blu-ray is no longer a proxy for "rare" (`docs/handoff.md` §3.6a).
+
+**`slow` and `medium` are not interchangeable at a fixed CRF.** Measured at 1080p: `slow`
+gains +0.30 to +0.53 VMAF at matched bitrate, and `medium` needs ~44% more bitrate to match
+`slow` CRF 21. Changing a preset means re-choosing the CRF with it. The film/tv split is
+decided from the **path**, a deliberate exception to "decide from the file" — it encodes how
+much a title is worth to its owner, which nothing can measure.
 
 ---
 
-## State as of handoff (2026-09-12)
+## State as of 2026-09-15
 
-**Validated, not yet run at scale.**
+**Two shows delivered and published.**
 
-- 25-file stratified sample: 25 analyzed, encoded, verified ✅
-- 4 full + 1 sample real encodes on the Proxmox box, all verified ✅ (2026-09-12)
-- Throughput measured: **4.88 min per 43.5-min DVD episode at `--jobs 3`** (8.9× realtime)
-- Coverage test across all code paths ✅
-- ~99% of library paths exercised
-- 10 bugs found and fixed, all by measurement (the 10th, `dts` misclassified as
-  lossless, on 2026-09-12)
-- 1 further bug caught **before shipping**: the A/V sync check's own false positive on
-  sampled encodes (rule 11) — verify.py again, exactly as rule 10 predicts
+| | Episodes | Output | Replaced |
+|---|---:|---:|---:|
+| Charmed | 173 | 63 GB | 132 GB |
+| Buffy | 143 | 47 GB | 136 GB |
 
-**Next steps** (detail in `docs/handoff.md` §7):
+- Charmed fixed a genuinely broken library: the old encodes ran at **25.833 fps** with a
+  **bt709 transfer on SD content**. Both corrected.
+- Buffy: 63 of 143 episodes deinterlaced, 80 passed through clean. Enabled after the owner
+  compared a repaired episode against an unrepaired one by eye.
+- **14 bugs found and fixed, all by measurement.** Bugs 12-14 were *measurement* defects,
+  not encode defects — see `docs/handoff.md` §5.
+- Throughput measured: **5.08 min** per 43.5-min DVD episode at `--jobs 3`; **4.78 min** for
+  Buffy unfiltered, **6.15 min** with the deint chain.
+- Blu-ray tiers split and each CRF measured against a lossless FFV1 reference (§3.6a).
 
-1. Regenerate plans — any plan predating the current `analyze.py` is stale
-2. Four **full** encodes (not samples) — **partly done**: 4 real Charmed episodes encoded
-   and verified on this box 2026-09-12, plus a `--sample 90`. But all four were the same
-   show. The diversity the step actually asks for is still open: **a long movie, a Blu-ray,
-   an untested show, and a degenerate-sub file**
-3. ~~On a new machine, confirm ffmpeg has `libx265`, `libvmaf`, and the filters, and that
-   rule #2 still holds~~ — **done on the Ubuntu box 2026-09-12** (`docs/handoff.md` §7.2.1).
-   Throughput there is still unmeasured; it needs real media.
-4. Bulk run: ~1,039 titles
+**In flight:** Hot Fuzz at `slow` CRF 19 — first end-to-end run of the `bluray-film` tier.
+
+**Next** (detail in `docs/handoff.md` §7.1):
+
+1. Verify Hot Fuzz, then the remaining 13 `bluray-film` titles (~60 h)
+2. `bluray-standard`, 15 titles (~24 h)
+3. Name the `ingest/` backlog — Dexter (33) needs disc mapping; Thornberrys S2P3/S3 (31) does not
+4. Measure `tune=animation` before encoding the cartoons
+5. The DVD queue: parks and rec, the 100, ash vs evil dead, then 436 movies
 
 **Known open items:**
 
-- 15 Buffy episodes have genuine mixed cadence → flagged `needs_review`; VapourSynth VIVTC is
-  the right tool
-- ~10 Charmed episodes show sporadic residual combing after IVTC; unresolved, ships anyway
-  since it is a large improvement over 26–32% duplicate frames
 - Per-episode crop varies within a series (cosmetic); a `--uniform-crop` mode would fix it
-- Plan filenames derive from the source stem only, so two sources with identical basenames in
-  different directories would collide silently (zero collisions in the current 1,219 files)
-
----
+- Plan filenames derive from the source stem, so identical basenames in different
+  directories would collide silently
+- Very large titles (60 GB+) lose the A/V drift check — audio seeks are pathological in big
+  Matroska files; every other check still runs
+- `bluray-tv` rests on one Killing Eve episode; re-measure when Office/BBT discs arrive
 
 ## Data
 
@@ -220,7 +230,7 @@ It pre-dates the pipeline and was used to forensically classify the old library.
 
 ## Working style for this project
 
-- **Measure before concluding.** Every one of the ten bugs was found by measurement; none by
+- **Measure before concluding.** Every one of the eleven bugs was found by measurement; none by
   reasoning. Two AI models independently reasoned their way to a destructive filter chain.
 - **Vertical slices.** Run one title end-to-end through all four stages before analyzing
   thousands. Then a *stratified* slice across content types — one TV show is not

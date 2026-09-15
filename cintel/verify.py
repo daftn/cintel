@@ -34,9 +34,24 @@ import sys
 from pathlib import Path
 
 FPS_TOL = 0.15        # absolute fps
+# Looser than FPS_TOL: both sides are sampled 20s windows of a source whose
+# rate genuinely varies, so the two measurements do not land on the same
+# stretch of content. Wide enough to absorb that, far too tight to hide a
+# dropped-frame error - decimation would show as roughly -4.8fps.
+VARIABLE_FPS_TOL = 0.60
 DURATION_TOL = 0.01   # fraction
 DUPLICATE_TOL = 0.02             # output ratio that triggers a source comparison
 DUPLICATE_INTRODUCED_TOL = 0.05  # how much more than the source is a failure
+# Deinterlacing confounds this metric, so a plan carrying a deint filter is
+# held to a much looser bound. mpdecimate counts NEAR-duplicates by a
+# difference threshold, and bwdif's interpolated frames are softer, so they
+# read as more similar to their neighbours whether or not any frame actually
+# repeats. Measured on Buffy: +0.6% introduced on s02e05, but +17.8% on s03e01,
+# from the same filter on the same kind of content - a spread that says the
+# number is measuring softness as much as repetition. Deliberately not
+# switched off altogether: at this bound a gross regression still fails, while
+# the ordinary consequence of a repair the owner asked for does not.
+DUPLICATE_INTRODUCED_TOL_DEINT = 0.25
 SYNC_TOL = 0.100                 # seconds of A/V drift we are willing to introduce
 SPAN_RATIO_TOL = 0.02            # video/audio span may differ by this fraction
 SAMPLE_SECONDS = 30
@@ -104,13 +119,31 @@ def duplicate_ratio(path: Path, start: int,
     return (int(b[-1]) - int(d[-1])) / int(b[-1])
 
 
+TAIL_WINDOW = 30      # seconds before the end to start the tail probe
+# Shorter than run()'s 300s default: these probes finish in seconds on any
+# normal file, so a long wait means the seek is pathological (see _pts_bounds)
+# and waiting longer will not help. Bounds a 143-title verify run.
+PTS_PROBE_TIMEOUT = 120
+
+
 def _pts_bounds(path: Path, stream: str) -> tuple[float | None, float | None]:
     """First and last presentation timestamp of a stream, cheaply.
 
-    Reads a few packets at the head and, via -read_intervals, a burst at 99%
+    Reads a few packets at the head and a time-bounded window at the tail
     rather than demuxing the whole file. Packets arrive in decode order, so
     min/max is taken rather than first/last - with B-frames the largest PTS is
     not the last packet.
+
+    The tail seek MUST be expressed in seconds, derived from the container
+    duration. In ffprobe's -read_intervals syntax `%` is the START/END
+    SEPARATOR, not a percent sign: an interval of "99%+#99999" does not mean
+    "the last 1% of the file", it means "start at 99 SECONDS, then read 99999
+    packets" - which stops wherever those packets run out. That was bug 11.
+    It read the true end only by luck, on files short enough for 99999 packets
+    to overshoot, and reported nonsense otherwise: on a 6600s DVD the video
+    burst ended at 4270s and the audio at 3299s, which the caller then
+    subtracted into -970 SECONDS of invented drift. Short-framed codecs make
+    it worse - DTS packets are 10.67ms, so 99999 of them span only 1067s.
     """
     def vals(cp: subprocess.CompletedProcess) -> list[float]:
         out = []
@@ -121,14 +154,34 @@ def _pts_bounds(path: Path, stream: str) -> tuple[float | None, float | None]:
                 pass
         return out
 
-    head = run(["ffprobe", "-v", "error", "-select_streams", stream,
-                "-read_intervals", "%+#40", "-show_entries", "packet=pts_time",
-                "-of", "csv=p=0", str(path)])
-    tail = run(["ffprobe", "-v", "error", "-select_streams", stream,
-                "-read_intervals", "99%+#99999",
-                "-show_entries", "packet=pts_time",
-                "-of", "csv=p=0", str(path)])
-    h, t = vals(head), vals(tail)
+    try:
+        duration = float(probe(path)["format"]["duration"])
+    except (KeyError, ValueError, RuntimeError):
+        return (None, None)
+
+    # A timeout here must DEGRADE, not raise. Seeking to an audio packet late
+    # in a very large MKV can take minutes, because Matroska cue points index
+    # the video track and little else - measured on a 62GB 4h13m concatenation,
+    # where video seeks returned instantly and audio seeks exceeded 300s. If
+    # that propagated, verify would report a perfectly good encode as failed,
+    # which is cardinal rule 10's exact failure. Returning None instead makes
+    # the caller say "could not compare", which is the truth.
+    def probe_pts(interval: str) -> list[float]:
+        try:
+            return vals(run([
+                "ffprobe", "-v", "error", "-select_streams", stream,
+                "-read_intervals", interval, "-show_entries", "packet=pts_time",
+                "-of", "csv=p=0", str(path)], timeout=PTS_PROBE_TIMEOUT))
+        except subprocess.TimeoutExpired:
+            return []
+
+    h = probe_pts("%+#40")
+    # "<seconds>%+#N" - from that point, capped BOTH ways. The time bound stops
+    # a short-framed codec running out of packets before the end (that was bug
+    # 11); the packet cap stops an enormous file reading to EOF. 40k packets is
+    # ~7 minutes of 96ms DTS frames and ~27 minutes of video, so on any sane
+    # stream the window closes on TAIL_WINDOW long before the cap bites.
+    t = probe_pts(f"{max(0.0, duration - TAIL_WINDOW):.3f}%+#40000")
     return (min(h) if h else None, max(t) if t else None)
 
 
@@ -182,7 +235,14 @@ def av_span_ratio(path: Path) -> float | None:
 
 
 def expected_fps(plan: dict) -> float | None:
-    """What the plan's cadence decision should produce."""
+    """What the plan's cadence decision should produce.
+
+    Returns None where no constant applies: a plan carrying fps_from_source
+    describes a source whose own rate is not uniform, so the only honest
+    reference is the source itself - see the framerate check in verify_one.
+    """
+    if plan.get("fps_from_source"):
+        return None
     cadence = plan.get("cadence")
     if cadence in ("film", "telecine"):
         return 24000 / 1001
@@ -256,9 +316,40 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
     if want and got is None:
         problems.append("could not measure output framerate")
     elif want and abs(got - want) > FPS_TOL:
-        problems.append(
-            f"framerate {got:.2f} != expected {want:.2f} "
-            f"(cadence={plan.get('cadence')})")
+        # Before failing, ask whether the SOURCE holds that constant either.
+        # Measured on Buffy 2026-09-15: five `film` episodes decode at
+        # 24.0-24.9 depending on the window, so asserting 23.976 failed
+        # faithful, unfiltered encodes. What matters is whether we CHANGED the
+        # rate - a wrong cadence filter shows as ~-4.8fps against the source,
+        # which this still catches. Same reasoning as the duplicate and drift
+        # checks, and the same trap as cardinal rule 10.
+        src_fps = decoded_fps(src, src_mid) if src.exists() else None
+        if src_fps is not None and abs(got - src_fps) <= VARIABLE_FPS_TOL:
+            pass  # output tracks its source; the plan's constant is what is wrong
+        else:
+            problems.append(
+                f"framerate {got:.2f} != expected {want:.2f} "
+                f"(cadence={plan.get('cadence')}"
+                + (f", source {src_fps:.2f}" if src_fps is not None else "")
+                + ")")
+    elif plan.get("fps_from_source"):
+        # No constant describes this output, because the source is not
+        # uniform. Compare against the SOURCE at the same offset instead -
+        # the same reasoning as the duplicate and drift checks. What matters
+        # is that we did not CHANGE the rate, not what the rate happens to be.
+        if got is None:
+            problems.append("could not measure output framerate")
+        elif src.exists():
+            src_fps = decoded_fps(src, src_mid)
+            if src_fps is None:
+                problems.append(
+                    f"framerate {got:.2f} and source unavailable "
+                    "for comparison")
+            elif abs(got - src_fps) > VARIABLE_FPS_TOL:
+                problems.append(
+                    f"framerate {got:.2f} vs source {src_fps:.2f} - "
+                    f"{got - src_fps:+.2f} introduced "
+                    f"(cadence={plan.get('cadence')})")
 
     # --- duplicate frames ---------------------------------------------------
     # The question is whether WE introduced duplicates, not whether any exist.
@@ -276,10 +367,16 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
             problems.append(
                 f"duplicate frames {dup*100:.1f}% and source unavailable "
                 "for comparison")
-        elif dup - src_dup > DUPLICATE_INTRODUCED_TOL:
-            problems.append(
-                f"duplicate frames {dup*100:.1f}% vs source "
-                f"{src_dup*100:.1f}% - {(dup - src_dup)*100:.1f}% introduced")
+        else:
+            deint = "bwdif" in (plan.get("cadence_filter") or "")
+            tol = (DUPLICATE_INTRODUCED_TOL_DEINT if deint
+                   else DUPLICATE_INTRODUCED_TOL)
+            if dup - src_dup > tol:
+                problems.append(
+                    f"duplicate frames {dup*100:.1f}% vs source "
+                    f"{src_dup*100:.1f}% - {(dup - src_dup)*100:.1f}% "
+                    f"introduced (tolerance {tol*100:.0f}%"
+                    + (", deinterlaced" if deint else "") + ")")
 
     # --- A/V sync -----------------------------------------------------------
     # Like the duplicate check, the question is whether WE introduced desync,

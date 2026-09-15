@@ -185,6 +185,10 @@ Each cost real debugging time and is commented where it matters:
 - `codec_name` is `dts` for both lossy DTS and lossless DTS-HD MA; only `profile`
   tells them apart, so "is it lossless" cannot be a codec-name lookup.
 - The colour-tag bug (above) does not reproduce on ffmpeg 6.1.1, only on 8.1+.
+- In `ffprobe -read_intervals`, `%` separates start from end and is *not* a percent
+  sign — `99%+#99999` means "from 99 seconds, 99999 packets". Seek by time instead.
+- `idet` on an *encoded* file under-reports combing — compression defeats the detector
+  while the artifact stays visible. Measure combing on the source.
 - macOS writes `._*` AppleDouble sidecars on SMB shares; they match media
   extensions but are not media.
 - BSD `xargs` has neither `-a` nor `-d`.

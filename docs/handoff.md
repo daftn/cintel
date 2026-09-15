@@ -44,18 +44,45 @@ move into the `cintel` repo; the layout is otherwise unchanged.)
 
 ### 2.2 Library
 
+Recounted on the encode box **2026-09-15** (AppleDouble `._*` sidecars excluded):
+
 | Location | Files | Meaning |
 |---|---:|---|
 | `raw/dvd/movies` | 436 | queued |
-| `raw/dvd/tv` | 752 | queued (incl. 185 Office — **drop, Blu-rays purchased**) |
-| `raw/bluray/movies` | 20 | queued |
-| `raw/bluray/tv` | 16 | queued |
-| `movies/` | 247 | library (220 old HEVC encodes + 27 mp4 downloads) |
-| `tv/` | 1,932 | library (547 old HEVC + h264/av1 downloads) |
+| `raw/dvd/tv` | 620 | see breakdown below |
+| `raw/bluray/movies` | 29 | queued (was 20; still growing as discs are ripped) |
+| `raw/bluray/tv` | 16 | queued (Killing Eve S1) |
+| `raw/processed/charmed` | 173 | **done** — sources moved here after publishing |
+| `ingest/` | 64 | ripped, awaiting naming before analysis |
 
-**~1,039 titles to encode** after dropping Office. (Counts re-verified on the encode box
-2026-09-12: 436 / 752 / 20 / 16. The earlier 751 and 184 were each one low; `raw/` totals
-3.8 TB.)
+`raw/dvd/tv` breakdown:
+
+| Show | Files | State |
+|---|---:|---|
+| the office | 185 | **drop** — Blu-rays purchased |
+| buffy | 143 | **done**, published 2026-09-15 |
+| parks and recreation | 122 | queued |
+| the 100 | 99 | queued |
+| the wild thornberrys | 41 | queued (S1 complete + S2 eps 1-21) |
+| ash vs evil dead | 30 | queued |
+
+**Convention:** sources move to `raw/processed/<title>/` once published, so `analyze` no
+longer scans them and the queue count stays meaningful. Sources are never deleted — rule 9
+depends on re-encoding remaining possible.
+
+**Queue arithmetic as of 2026-09-15:**
+
+```
+done                    316   (Charmed 173 + Buffy 143)
+queued now              773   (436 dvd movies + 292 dvd tv + 29 bd movies + 16 bd tv)
+awaiting naming          64   (Dexter 33, Thornberrys S2P3+S3 31)
+inbound on Blu-ray     ~480   (The Office ~200, Big Bang Theory ~280)
+                     ------
+remaining             ~1,317
+```
+
+The original "~1,039 titles" figure predates all of this. It excluded the Office Blu-rays,
+the growing Blu-ray movie collection, and the cartoons.
 
 ### 2.3 Plans generated
 
@@ -201,6 +228,221 @@ Gemini independently estimated the medium→slow efficiency gap at 480p as **10�
 conclusion still holds, because at ~2 Mbps there is enough bitrate that `medium` brute-forces
 past its own algorithmic limits.
 
+### 3.5a Irregular cadence: repair without decimating (2026-09-13)
+
+Mixed and irregular cadence used to be refused outright — `needs_review`, no encode. On
+Buffy that was **20 of 143 episodes**. Refusing is safer than guessing, but it is not better
+than a treatment that provably cannot do harm, and the old pre-pipeline script had shipped
+all 143 without incident.
+
+**The insight is that `decimate` is the only destructive step.** A chain of
+
+```
+fieldmatch,bwdif=deint=interlaced        # note: NO decimate
+```
+
+reconstructs whole frames from fields where content was telecined, then deinterlaces only
+what is still flagged combed (`bwdif` defaults to `mode=send_frame`, preserving frame
+count). Because no frame is ever removed, applying it to already-progressive content
+**cannot** produce cardinal rule 1's 19.2fps catastrophe. The worst case is wasted effort,
+not destroyed picture, and that asymmetry is what makes it safe where cadence cannot be
+proven.
+
+Five cadence verdicts replace the blanket refusal. **Combing, not frame rate, decides**: if
+nothing is combed there is nothing to repair, so passthrough is correct whatever the rate
+reads.
+
+| Verdict | Condition | Filter |
+|---|---|---|
+| `film_variable` | film-ish rates, no real combing | none |
+| `mixed_variable` | rates span film and video, no combing | none |
+| `film_deint` | film-ish rates WITH combing (IVTC probe returns ~19.2, proving already decimated) | `DEINT_FILTER` |
+| `mixed_deint` | rates span both, combed | `DEINT_FILTER` |
+| `video_deint` | combed 29.97 where IVTC does not recover film | `DEINT_FILTER` |
+
+`review` now means only that the rate could not be measured at all.
+
+All five set `fps_from_source`, because no constant describes their output. `verify` then
+compares the output rate against the **source** rather than a constant, exactly as the
+duplicate and drift checks do — the question is whether we CHANGED the rate, not what the
+rate happens to be. Tolerance `VARIABLE_FPS_TOL = 0.60`: wide enough for two sampled windows
+of a genuinely varying source, far too tight to hide decimation, which shows as ~-4.8fps.
+
+**Validated on `Buffy s03e01 - Anne`**, whose combing is localised (clean at 60/540/780s,
+heavily combed at ~300s, ~1020s and ~1347s):
+
+| | interlaced | progressive | combed | fps |
+|---|---:|---:|---:|---:|
+| source @1347s | 1438 | 291 | **83.2%** | 30.0 |
+| output | **0** | 1699 | **0.0%** | **30.0** |
+
+Combing eliminated, frame rate preserved, `verify --sample` passes. The existing library
+encode of this episode passed the combing straight through, so this is a genuine improvement
+on it.
+
+**Switched ON after two analyzer bugs were found and the owner compared the output by eye
+(2026-09-14).** The history below is kept because the reasoning was wrong in an instructive
+way, twice.
+
+#### Why the chain was nearly abandoned
+
+Two bugs made Buffy look far cleaner than it is:
+
+1. **Combing was sampled from ONE 20s window per title.** The decoded rate was already
+   sampled three times; combing was sampled once, and that single number decided the cadence
+   verdict for a whole episode. On `s02e22` one window reported **3.2%**; twenty-one windows
+   across the same episode reported **42.2%**, 13 of them over 10%. Combing on these discs is
+   scattered, so one window is a coin flip. Now `COMBING_SAMPLES = 9`.
+2. **The `film` branch never read the combing measurement at all.** If every sampled rate sat
+   near 23.976 it returned `film` on the rate alone. So a soft-telecined episode carrying
+   interlaced content inside its frames was declared clean: `s02e05` at **58%** combed,
+   `s02e19` at 49%, `s02e06` at 44% — all classified `film`, no filter, no flag.
+
+Together these reported **12 combed episodes**. The real figure is **58 of 143**, with a
+median of 15.8% among them and 85 genuinely clean (median 0.0%). Every argument for leaving
+the combing alone — "affects 8% of the series", "no defect to repair" — rested on those two
+bugs.
+
+#### What decided it
+
+The owner watched `s02e05 Reptile Boy` (the worst episode, 40% combed at source) repaired
+against unrepaired and reported the repaired version "definitely better on the lines". That
+is the only evidence that settled it, because **the metrics could not separate the two**:
+
+| version | combed (idet) | dupes | size |
+|---|---:|---:|---:|
+| source | 40.1% | 3.9% | 2.01 GB |
+| unfiltered encode | 2.0% | 4.4% | 0.37 GB |
+| deinterlaced encode | 1.3% | 5.0% | 0.36 GB |
+
+> **`idet` on ENCODED output under-reports combing badly.** The unfiltered encode reads 2.0%
+> against a 40.1% source, yet the combing is plainly visible in it. x265 alters the comb
+> pattern enough to fool the detector without removing it from the picture. **Measure combing
+> on the SOURCE.** Every "output combing" figure gathered before this was realised is
+> unreliable, including the ones used to choose which episodes to eyeball.
+
+#### Scope: Buffy is an outlier, not the library
+
+A 40-title stratified sample re-analyzed with the fixed detection:
+
+| class | titles | median combing | >10% |
+|---|---:|---:|---:|
+| DVD movies | 25 | 0.0% | 1 (The Road to El Dorado, 12.9%) |
+| DVD TV | 13 | 0.0% | 0 |
+| Blu-ray | 2 | 0.0% | 0 |
+
+All four already-encoded diversity titles measure **0.0%** — nothing shipped is affected, and
+the ~1,000-title queue needs no reconsideration. `DEINT_COMBED = True` is therefore safe
+globally: the filter only attaches above 10% measured combing, which in practice is Buffy.
+
+`verify`'s duplicate check uses `DUPLICATE_INTRODUCED_TOL_DEINT` (25%) for deinterlaced
+plans, because mpdecimate counts near-duplicates and interpolated frames read as similar
+whether or not anything repeats — measured +0.6% introduced on one episode and +17.8% on
+another from the same filter.
+
+#### Earlier reasoning, superseded
+
+**The chain was measured and switched off (2026-09-14, before the bugs were found).** It removes combing
+convincingly, but `verify` rejected 4 of 12 episodes for introduced duplicates:
+
+| episode | output dupes | source dupes | introduced |
+|---|---:|---:|---:|
+| s03e01 Anne | 21.6% | 3.8% | **+17.8%** |
+| s03e20 The Prom | 23.9% | 16.9% | +7.0% |
+| s03e10 Amends | 12.3% | 5.5% | +6.8% |
+| s07e16 | 21.2% | 15.1% | +6.1% |
+
+The cause is **`bwdif`, not `fieldmatch`** — removing `fieldmatch` changes nothing, because
+interpolated frames are softer and soft frames read as near-duplicates to `mpdecimate`.
+Whether those are truly repeated frames or an artefact of the softening was **not
+established**.
+
+Two further measurements worth keeping, both contradicting what was first written here:
+
+- `bwdif` defaults to **`mode=send_field`, which DOUBLES the frame rate** (50fps measured).
+  `mode=send_frame` must be stated explicitly.
+- `deint=interlaced` acts on the frame's **interlaced flag, not its content**. Disc rips
+  rarely set it, so without `idet` in front bwdif is nearly idle — it contributed only 2.5
+  points on s07e16 (20.8% → 18.3%), where adding `idet` reached 5.3%.
+
+`DEINT_COMBED = False` in `analyze.py` turns the whole thing off, and combed files are
+passed through unfiltered. The reason is outside the filter: **Buffy's existing library
+encodes are already correct** (23.976, smpte170m), unlike Charmed's, which were genuinely
+broken. With no defect to repair, trading sharpness and a failing verify to remove combing
+from 12 of 143 episodes is gold-plating. Flip the constant to re-enable; plans record which
+way it was set.
+
+Result across Buffy: **143 of 143 now encode**, against 123 before — all unfiltered, 0
+refused. The verdicts are `film_combed` / `mixed_combed` / `video_combed` rather than
+`*_deint`, since nothing is being deinterlaced.
+
+> **Honest limit.** `bwdif` interpolates the frames `fieldmatch` could not reconstruct, so
+> those are softer than a true field match would be. Running `fieldmatch` first minimises how
+> many frames need it. This repairs combing; it does not recover 24p from mixed content the
+> way VapourSynth VIVTC would. VIVTC remains the better tool and remains unjustified — it
+> would mean abandoning the zero-dependency property for what is now **zero** refused files.
+
+### 3.6a The Blu-ray tier, measured (2026-09-13)
+
+Everything in §3.6 was measured on a **480p Charmed episode**. The Blu-ray row of the config
+— `slow`, CRF 21 — was a row lifted from that DVD sweep, never measured on Blu-ray content.
+Two sweeps against lossless FFV1 references fixed that, and both findings contradict §3.6.
+
+**Finding 1: `slow` is far more efficient than §3.6 assumes, and CRF is not comparable
+across presets.** On the hardest 180s of Hot Fuzz (grainy 35mm, the hardest content in the
+library), at *matched bitrate*:
+
+| bitrate | slow VMAF | medium VMAF | slow advantage |
+|---:|---:|---:|---:|
+| 12.49 Mbps | 98.58 | 98.05 | +0.53 |
+| 15.14 | 98.78 | 98.34 | +0.44 |
+| 18.17 | 98.94 | 98.58 | +0.36 |
+| 21.62 | 99.07 | 98.77 | +0.30 |
+
+`medium` needs **+44% bitrate** to match `slow` CRF 21, and cannot reach `slow` CRF 20's
+quality at any CRF in 17–22. §3.6 assumed the gap was 1–3% and treated Gemini's 10–15%
+estimate as the pessimistic case; at 1080p it is ~44%. Note also that at the *same* CRF,
+`slow` produces a **larger, better** file than `medium` — so the two presets cannot be
+compared row-by-row, only as rate-quality curves. §3.6's "preset does not buy quality" is
+the idealised statement and is misleading in practice.
+
+Measured cost: `slow` is **3.2×** the encode time of `medium` (634s vs 201s for 180s of
+1080p at CRF 20; 610s vs 188s at CRF 21).
+
+**Finding 2: content matters more than tier.** Killing Eve encodes ~10× smaller than Hot
+Fuzz at identical settings (2.10 vs 24.47 Mbps at medium CRF 20) despite having a *higher*
+source bitrate (31 vs 25.6 Mbps). Clean digital TV is cheap; grainy 35mm is not.
+
+**Resulting tiers** (see `analyze.TIERS`):
+
+| tier | preset | CRF | evidence |
+|---|---|---:|---|
+| `dvd` | medium | 20 | §3.6, unchanged |
+| `bluray-film` | slow | **19** | VMAF 99.07 / SSIM 0.9665 on Hot Fuzz's hardest 180s; ~12 GB/film, ~240 GB for 20 titles |
+| `bluray-tv` | medium | **21** | VMAF 93.97 worst-segment on Killing Eve; ~1.74 Mbps/ep, ~143 GB for ~500 eps |
+
+The film/tv split exists because **Blu-ray stopped being a proxy for "rare."** The Office
+(~200 eps) and Big Bang Theory (~280) arriving on disc take Blu-ray TV from 16 files to
+~500 — about 170 hours of content against 40 hours of Blu-ray film. Holding that tier at
+`slow` would cost ~336 hours against ~116 at `medium`, for +1.4 VMAF on shows the owner has
+explicitly deprioritised. This is §3.6's own "cheap where it is plentiful, careful where it
+is rare," re-applied now that the inventory has changed underneath it.
+
+> **The split is decided from the PATH, not the file** — `raw/bluray/tv` vs
+> `raw/bluray/movies` — which is a deliberate exception to principle 1. The distinction is
+> not a property of the content: it records how much the owner cares about a title, and no
+> measurement can recover that. `resolve_tier()` returns its reason so every plan carries
+> the inference as evidence. Anything outside the known layout falls to `bluray-film`, the
+> careful side.
+
+**Metrics are not comparable across content.** Killing Eve scores SSIM 0.986 with VMAF 94;
+Hot Fuzz scores SSIM 0.968 with VMAF 98.9. Grain depresses SSIM at any bitrate; detail loss
+depresses VMAF even where structure survives. Both are valid *within* one title's curve and
+meaningless *between* titles.
+
+**Open:** re-measure `bluray-tv` when the Office and Big Bang Theory discs arrive. Killing
+Eve is a dark prestige drama and a poor proxy for brightly-lit multi-cam sitcoms.
+
 ### 3.7 HEVC 10-bit, not AV1
 
 AV1 would save 20–30% and `libsvtav1` is available. **Rejected on direct-play grounds:** AV1
@@ -286,6 +528,22 @@ Validated by deliberately committing cardinal rule 1's catastrophe — `decimate
 episode that would be roughly eight minutes of accumulated desync.
 
 Measured on the four real full encodes: **−9 ms introduced**, against a 100 ms tolerance.
+
+**Then bug 11 (2026-09-13).** The first long movie and the first DTS source both failed this
+check with absurd numbers — `−970,320 ms` on Goldfinger, `+1,066,699 ms` on Killing Eve.
+Cardinal rule 10 applied exactly as written: the encodes were fine and the checker was
+wrong. `_pts_bounds` bounded its tail probe by *packet count* (`99%+#99999`), which on
+ffprobe's syntax means "from 99 seconds, 99999 packets" — so the burst stopped wherever
+those packets ran out. On Goldfinger the video burst ended at 4,270s and the audio at
+3,299s of a 6,600s file, and the difference became the reported drift. Charmed passed only
+because 99999 packets overshoot the end of a 43-minute episode. Short-framed codecs make it
+sharper still: DTS packets are 10.67 ms, so 99999 of them span 1,067s.
+
+Fixed by seeking to `duration − 30s` and reading to EOF, bounding the window by time
+instead. Re-measured on the same three encodes: **−17 ms, 0 ms, +22 ms introduced**, and
+the four samples still pass — now for the right reason.
+
+That makes **five of the last six bugs live in `verify.py`**, not in the encodes.
 
 ### 3.9 Subtitles: English only, and **no automated burn-in**
 
@@ -417,6 +675,48 @@ picture content to be dismissed — but Cb ≈46 against a neutral 128 is unmist
 
 Always `-nostdin`, or it will consume a calling shell loop's input.
 
+**`idet` on an ENCODED file under-reports combing.** Compression alters the comb pattern
+enough to defeat the detector while leaving it visible on screen: a 40.1%-combed source
+encoded unfiltered measured 2.0%. Judge combing from the SOURCE, and judge a repair by eye.
+
+**Combing must be sampled at several points, and the `film` verdict must consult it.** Both
+were bugs on 2026-09-14; see §3.5a. A single window misreported 3.2% where nine reported
+42%, and the `film` branch returned on frame rate without reading combing at all.
+
+**Seeking an AUDIO packet late in a very large MKV can take minutes.** Matroska cue points
+index the video track and little else. Measured on a 62GB 4h13m file: the video tail probe
+returned in **2s**, the audio one exceeded **300s**. `verify._pts_bounds` therefore bounds
+each probe with `PTS_PROBE_TIMEOUT` and returns empty on timeout, so `av_drift` reports
+`None` and verify says "could not compare" instead of raising - a timeout must never fail a
+good encode (cardinal rule 10).
+
+The consequence is real: **very large titles lose the A/V drift check.** Matroska's
+per-track `DURATION` tag would give the answer instantly, but it is **not reliably present**
+- the ffmpeg-written concatenation carries it, MakeMKV rips do not - and using tags for one
+file while packet-probing the other would compare two different measurements, which is how
+bug 11 happened. Every other check still runs on these titles.
+
+On Matroska remuxes, **`pts_time` is `N/A` on a large share of video packets** — 54% of
+Hot Fuzz's, which carry DTS only. Any per-packet timing or bitrate analysis must fall back
+to `dts_time`, or those packets silently collapse to t=0. Caught only because the resulting
+bin read 3,775 Mbps, which is impossible; a subtler error would have passed.
+
+**Pick a tuning segment by where quality is worst, not where bitrate is highest.** At
+constant CRF x265 spends bits exactly where content is hard, so the highest-bitrate segment
+is often the one it handled *successfully*. Measured on Killing Eve: the top-bitrate 180s
+scored VMAF 96.84 at medium CRF 21 while an average-bitrate segment scored 93.97, and
+degradation across CRF 20→24 was slightly *steeper* on the cheap segment (2.11 vs 1.80
+points). This does not reproduce §3.6's DVD finding; on one title it inverts it. Safest
+practice is to measure both and take the worst. Note also that the source's bitrate profile
+is useless for this on a near-CBR master — Killing Eve's source is flat at peak/mean 1.09
+while its *encoded* profile ranges 2.75×.
+
+In `ffprobe -read_intervals`, **`%` separates start from end — it is not a percent sign.**
+`99%+#99999` means "start at 99 *seconds*, read 99999 packets", not "the last 1% of the
+file". There is no percentage form; seek by time, computed from the container duration. Bug
+11 lived here for a day because the wrong reading happens to give the right answer on files
+short enough for the packet budget to overshoot the end.
+
 ---
 
 ## 5. Bugs found, and why each matters
@@ -435,6 +735,10 @@ All were found by measurement. None by reasoning.
 | 8 | `verify --sample` compared the sample against the source's opening credits | False failures reporting invented duplicate frames |
 | 9 | Initial CRF sweep ran on an easy segment | Nearly selected CRF 22; degradation is 4–5× steeper on hard content |
 | 10 | Every `dts` stream classified as lossless | Lossy DTS 5.1 re-encoded to E-AC3 for nothing — a gratuitous generation of loss, on a codec common across the DVD tier |
+| 11 | `av_drift`'s tail probe seeked by packet count, not time | **Invented drift of up to −970 SECONDS**, failing good encodes. Passed on 43-min episodes by luck; bit the first long movie and the first DTS source |
+| 12 | Combing sampled from ONE window per title | 123 of 143 Buffy episodes classified `film` (clean) when 58 were combed. One window read 3.2% where nine read 42.2% |
+| 13 | The `film` verdict never read the combing measurement | Rate alone decided it, so soft-telecined episodes at 44-58% combed were declared clean and shipped unrepaired |
+| 14 | Framerate asserted against a constant with no source fallback | 5 faithful, unfiltered Buffy encodes failed verify for tracking sources that are not uniformly 23.976 |
 
 ### 5.1 Bug 7 in detail — the one to understand
 
@@ -474,6 +778,7 @@ No missing video, multi-video, missing audio, or bad durations.
 | Charmed batch | 4 full episodes | 3 pass, 1 exposed bug 7 |
 | **Full encodes on Ubuntu/9.0.1** | 4 real Charmed episodes + 1 sample | **5/5 verified**; −9 ms A/V drift introduced |
 | **A/V sync check** | correct vs deliberately `decimate`-broken clip | ratio 0.9964 pass / 0.7972 fail |
+| **Diversity set** (2026-09-13) | long DVD movie, Blu-ray film, Blu-ray TV, degenerate-sub show | 4 samples + 3 full encodes verified; exposed bug 11 |
 | Preset comparison | slow vs medium, full episodes | medium = same size, 45% of the time |
 | CRF sweep | easy + hard segments, FFV1 reference | CRF 20 selected |
 
@@ -487,13 +792,45 @@ episode** at `medium` CRF 20, roughly 4–5× realtime. Charmed ≈ 25 hours sin
 
 ## 7. What is left
 
-### 7.1 Immediate
+### 7.1 Immediate (rewritten 2026-09-15)
 
-1. **Regenerate all plans** — every existing plan is stale (analyzer fingerprint changed).
-2. **Four full encodes** — a long movie, a Blu-ray, an untested show, a degenerate-sub file.
-   Samples validate plan correctness but cannot catch mid-file failures, which is exactly how
-   bug 7 presented.
-3. **Drop Office** from the queue (184 files; Blu-rays purchased).
+Everything in the original list is done: plans regenerated, full encodes run across a long
+movie, a Blu-ray, an untested show and a degenerate-sub file, and Office dropped.
+
+**Delivered**
+
+| | Episodes | Output | Replaced | Notes |
+|---|---:|---:|---:|---|
+| Charmed | 173 | 63 GB | 132 GB | fixed 25.833fps timing + bt709 transfer on SD |
+| Buffy | 143 | 47 GB | 136 GB | 63 episodes deinterlaced, 80 clean |
+
+**In flight:** Hot Fuzz at `slow` CRF 19, the first end-to-end run of the `bluray-film`
+tier. Validates the lossless-audio path (DTS-HD MA -> E-AC3 640k) at full length.
+
+**Next, in order of value**
+
+1. **Verify Hot Fuzz**, then encode the remaining 13 `bluray-film` titles (~60 h). These are
+   the owner's stated priority. Kill Bill alone is ~9.4 h at 4h13m.
+2. **`bluray-standard`**, 15 titles (~24 h). Settings measured on Fast Five (§3.6a).
+3. **Name the `ingest/` backlog.** Dexter's 33 files are `1.mkv`-`26.mkv` plus
+   `C1_t01`-`D2_t07`, with no disc grouping to order by - the mapping cannot be inferred
+   from the files and must come from the discs. The Thornberrys S2P3/S3 rips (31 files) do
+   have disc directories and can be named the same way S1/S2 were.
+4. **Measure `tune=animation`.** Both cartoons classify `video` cadence with 30-50%
+   *legitimate* duplicate frames (drawn on twos). x265's animation tuning is unused and
+   untested here; flat cel-shaded content at CRF 20 is where it would matter.
+5. **The DVD queue** - parks and recreation, the 100, ash vs evil dead, then 436 movies.
+6. **Re-measure `bluray-tv`** when the Office and Big Bang Theory discs arrive. Killing Eve
+   is a dark drama and a poor proxy for lit multi-cam sitcoms (§3.6a).
+
+**Known open, carried forward**
+
+- Per-episode crop varies within a series (cosmetic; `--uniform-crop` unbuilt). Measured on
+  Charmed: 9 distinct crops, 6 in season 1 alone, spanning 708-720px wide.
+- Plan filenames derive from the source stem, so two sources with identical basenames in
+  different directories collide silently. Still zero collisions, but the `ingest/` files
+  named `1.mkv` would have caused one.
+- Very large titles lose the A/V drift check (§4 gotchas, Kill Bill at 62 GB).
 
 ### 7.1a Encode concurrency
 
@@ -608,12 +945,20 @@ deleting them, so rollback is a `mv`.
   across a sample and apply it show-wide. Cosmetic.
 - **~10 Charmed episodes show sporadic residual combing** after IVTC (3–8% of frames by
   idet). `fieldmatch=combmatch=full` fixed one episode and made three others much worse;
-  adding `bwdif` made idet scores 5–8× worse, which may mean idet is being confused rather
-  than the picture degrading. Unresolved; plain `fieldmatch,decimate` ships regardless since
-  it is a large improvement over 26–32% duplicates.
-- **15 Buffy episodes have genuine mixed cadence** and are flagged `needs_review`. IVTC would
-  take them to 19.2–22.2 fps. VapourSynth VIVTC is the right tool; 15 episodes is one
-  evening.
+  adding `bwdif` made idet scores 5–8× worse. Shipped as-is 2026-09-15 with plain
+  `fieldmatch,decimate`, a large improvement over 26–32% duplicates.
+  **The suspicion that "idet is being confused rather than the picture degrading" was
+  later confirmed** — see §3.5a: `idet` on an encoded file under-reports combing badly, so
+  these 3–8% figures are not comparable to source measurements and may understate or
+  overstate what is visible. If this is revisited, measure the SOURCE and judge the repair
+  by eye.
+- ~~**15 Buffy episodes have genuine mixed cadence** and are flagged `needs_review`~~ —
+  **resolved 2026-09-15.** The count was wrong (two analyzer bugs, §3.5a); the real figure is
+  58 episodes above 10% combing out of 143. All 143 now encode, and 63 are deinterlaced with
+  a chain that never decimates, so the 19.2fps failure is structurally impossible.
+  VapourSynth VIVTC would still recover true 24p from genuinely mixed content and remains
+  the better tool — but with zero refused files it is no longer justified against the
+  zero-dependency property.
 - **13 movies have no surviving source.** 4 of those are damaged (`007 - Dr. No` has no
   source but is *not* damaged — see the §3.4 retraction; the real four are `U571`,
   `Land Before Time 6`, `Land Before Time 7`, and one other). Those need a re-rip, not a
@@ -671,7 +1016,7 @@ toolchain     ffmpeg n9.0.1 / x265 4.2 (static, /usr/local/bin) - NOT apt's 6.1.
 
 1. **Decide from the file, not from a label.** Every defect in the old library traced to a
    human-supplied profile being applied to content it didn't fit.
-2. **Measure; do not reason.** Ten bugs, all found by measurement. Two independent AI models
+2. **Measure; do not reason.** Fourteen bugs, all found by measurement. Two independent AI models
    reasoned their way to a filter chain that would have destroyed the library.
 3. **Verify against an explicit plan.** This is what makes the whole approach viable — it
    turns silent corruption into a loud failure.
