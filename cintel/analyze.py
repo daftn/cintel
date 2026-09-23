@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import array
 import concurrent.futures
 import dataclasses
 import functools
@@ -582,7 +583,8 @@ def resolve_color(a: Analysis, vstream: dict, height: int) -> None:
                "space": space, "range": rng}
 
 
-def resolve_tier(path: Path, height: int) -> tuple[str, str]:
+def resolve_tier(path: Path, height: int,
+                  override: str | None = None) -> tuple[str, str]:
     """Pick the quality tier, and return the evidence for the choice.
 
     Resolution separates dvd from bluray, and that part is decided from the
@@ -601,22 +603,130 @@ def resolve_tier(path: Path, height: int) -> tuple[str, str]:
     choice - spending too much on an episode is recoverable, and under-spending
     on a favourite film is the failure that matters.
     """
+    # An explicit --tier wins over everything except the resolution check,
+    # which is a measurement and not a preference. The override exists for a
+    # homogeneous batch the owner does not want to file by hand; it is NOT the
+    # default, because a flag lives only in one shell invocation while a plan
+    # gets regenerated every time analyze.py changes (three times on
+    # 2026-09-20 alone). Folder placement survives that, an argument does not.
+    if override:
+        if height <= 576 and override != "dvd":
+            return "dvd", (f"height {height} <= 576 overrides --tier "
+                           f"{override}")
+        return override, f"--tier {override} given explicitly"
     if height <= 576:
         return "dvd", f"height {height} <= 576"
     parts = {part.lower() for part in path.parts}
     if "tv" in parts:
         return "bluray-tv", "path contains a 'tv' directory"
     if "movies" in parts:
+        # Folder placement and the curated list are both path-based evidence
+        # for the same decision, so either is honoured - dropping a rip into
+        # movies/standard/ or movies/film/ works without also maintaining the
+        # text list, and the text list keeps working for anything left
+        # directly in movies/.
+        if "standard" in parts:
+            return "bluray-standard", "path contains a 'standard' directory"
+        if "film" in parts:
+            return "bluray-film", "path contains a 'film' directory"
         if path.stem.lower() in standard_titles():
             return "bluray-standard", "listed in bluray-standard.txt"
-        return "bluray-film", "path contains a 'movies' directory"
+        # Unfiled, directly in movies/. Falls to the careful tier on purpose:
+        # overspending on a title is recoverable, under-spending on a
+        # favourite is not (rule 9).
+        return "bluray-film", "directly in 'movies'; UNFILED, defaulted to film"
     # Distinguished from the line above on purpose: a confident match and a
     # fallback must not leave identical evidence, or a misfiled source is
     # indistinguishable from a correctly-placed one at review time.
     return "bluray-film", "no 'tv' or 'movies' directory in path; DEFAULTED to film"
 
 
-def resolve_audio(a: Analysis, streams: list[dict]) -> None:
+# A commentary track can carry the same channel count, language tag, and
+# even a plausible-sounding title ("Stereo") as a genuine alternate mix - on
+# this library MakeMKV had already tagged a commentary track "Stereo" with
+# no disposition.comment flag set. There is no metadata that reliably tells
+# the two apart. But their CONTENT does: an alternate mix of the same show
+# audio shares the same dialogue and effects, so it correlates strongly with
+# the main track at zero lag; commentary is a different, mostly-independent
+# recording laid over a ducked copy of the show, so it does not.
+#
+# One window per file is not enough - the SAME trap as bug 12 (one combing
+# window misread Buffy 58 times). A commentary track goes quiet exactly when
+# the commentator does not, leaving only the ducked show audio underneath,
+# which DOES correlate well with the main mix for that stretch. Measured on
+# 7 confirmed-commentary Friends episodes, 6-7 windows each: every episode
+# had at least one window over 0.15 (one hit 0.21), which a single- or
+# two-window max would have read as a genuine alternate mix. The MEDIAN
+# across AUDIO_CORR_SAMPLES windows stayed under 0.04 for all 7 - use that,
+# not max.
+AUDIO_CORR_SAMPLES = 7
+AUDIO_CORR_WINDOW = 15
+AUDIO_CORR_THRESHOLD = 0.15
+
+
+def _extract_pcm(path: str, stream_spec: str, start: float, dur: float,
+                  sr: int = 8000) -> array.array:
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-ss", str(start), "-t", str(dur),
+           "-i", str(path), "-map", stream_spec, "-ac", "1", "-ar", str(sr),
+           "-f", "s16le", "-"]
+    try:
+        out = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=TIMEOUT).stdout
+    except subprocess.TimeoutExpired:
+        return array.array('h')
+    return array.array('h', out[:len(out) - len(out) % 2])
+
+
+def _pearson(a: array.array, b: array.array) -> float:
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    a, b = a[:n], b[:n]
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = sum((x - ma) ** 2 for x in a) ** 0.5
+    db = sum((y - mb) ** 2 for y in b) ** 0.5
+    return num / (da * db) if da and db else 0.0
+
+
+def tracks_correlate(path: str, spec_a: str, spec_b: str, duration: float,
+                      samples: int = AUDIO_CORR_SAMPLES,
+                      window: int = AUDIO_CORR_WINDOW,
+                      max_lag_ms: int = 80, sr: int = 8000) -> float | None:
+    """Median zero-ish-lag correlation between two audio streams of the same
+    file, sampled at several points spread across the runtime (sample_points
+    - same spread used for the combing scan, and for the same reason: a
+    per-window signal that is this noisy needs many windows and a robust
+    statistic, not one reading trusted alone). Each window is maxed over a
+    small lag search - the two tracks can be offset by a frame or two of
+    encoder latency even when genuinely the same content.
+
+    Returns None if fewer than half the windows could be read (e.g. the file
+    is too short) - too little evidence to call it either way.
+    """
+    max_lag = max(1, int(sr * max_lag_ms / 1000))
+    readings: list[float] = []
+    for start in sample_points(int(duration), samples):
+        a = _extract_pcm(path, spec_a, start, window, sr)
+        b = _extract_pcm(path, spec_b, start, window, sr)
+        if not a or not b:
+            continue
+        best = -1.0
+        for lag in range(-max_lag, max_lag + 1, max(1, max_lag // 8)):
+            aa, bb = (a[lag:], b[:len(b) - lag] if lag else b) if lag >= 0 \
+                else (a[:len(a) + lag] if lag else a, b[-lag:])
+            c = _pearson(aa, bb)
+            if c > best:
+                best = c
+        readings.append(best)
+    if len(readings) < samples / 2:
+        return None
+    readings.sort()
+    return readings[len(readings) // 2]
+
+
+def resolve_audio(a: Analysis, streams: list[dict], duration: float) -> None:
     """One stereo AAC track for phones/tablets, one surround track for
     everything else. Lossless surround is transcoded rather than copied: on
     this library a TrueHD track was 55% of the file, larger than the video."""
@@ -666,11 +776,46 @@ def resolve_audio(a: Analysis, streams: list[dict]) -> None:
     # Prefer a dedicated stereo track from the disc over folding the surround
     # mix down ourselves. A studio stereo mix is made for stereo playback;
     # an algorithmic downmix is a compromise. Copying it is also free.
+    #
+    # BUT: a commentary track looks identical to a genuine alternate mix by
+    # every metadata field this library has ever seen carried over from a
+    # DVD - same language tag, same channel count, sometimes even a "Stereo"
+    # title tag on the commentary itself (bug 18). Verify by content before
+    # trusting it: a real alternate mix shares the same dialogue and effects
+    # as the main track, so it correlates strongly at zero lag; commentary is
+    # a mostly-independent recording over a ducked copy of the show and does
+    # not. 27 of 226 Friends episodes hit this branch; all 27 measured at
+    # 0.01-0.03 correlation and were commentary, none were a genuine mix.
     dedicated = [s for s in preferred
                  if int(s.get("channels") or 0) == 2
                  and s["index"] != idx]
-    if dedicated:
-        stereo_src = dedicated[0]
+    stereo_src = dedicated[0] if dedicated else None
+    if stereo_src is not None:
+        corr = tracks_correlate(a.path, f"0:{idx}", f"0:{stereo_src['index']}",
+                                 duration)
+        # None is not "inconclusive, trust it anyway" - it is "could not be
+        # checked", and an unverified track gets the same treatment as a
+        # verified-bad one. Measured on Ash vs Evil Dead 2026-09-21: 4
+        # episodes' "English Stereo" track was a 31-packet stub covering
+        # about one second, not a real alternate mix - the same failure
+        # shape as bug 7's degenerate subtitle track, on audio instead. The
+        # correlation windows correctly found nothing to measure; trusting
+        # that as "the disc's own stereo mix" would have shipped a track
+        # that is silent for all but the first second of every episode.
+        if corr is None or corr < AUDIO_CORR_THRESHOLD:
+            a.notes.append(
+                (f"disc has a second {stereo_src.get('codec_name')} stereo "
+                 f"track but it correlates at only {corr:.2f} with the main "
+                 f"mix (< {AUDIO_CORR_THRESHOLD}) - almost certainly "
+                 "commentary, not an alternate mix"
+                 if corr is not None else
+                 f"disc has a second {stereo_src.get('codec_name')} stereo "
+                 "track but it could not be measured against the main mix "
+                 "(too little decodable audio - likely a degenerate/stub "
+                 "track, see bug 7) - not trusted without evidence")
+                + "; excluded, downmixing the main track instead")
+            stereo_src = None
+    if stereo_src is not None:
         a.audio.append({
             "role": "stereo", "source_index": stereo_src["index"],
             "codec": "copy",
@@ -839,7 +984,7 @@ def build_argv(a: Analysis, src: Path, dst: Path, version: str,
 
 
 def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
-            quick: bool = False) -> Analysis:
+            quick: bool = False, tier: str | None = None) -> Analysis:
     a = Analysis(path=str(path))
     try:
         probe = ffprobe_json(path)
@@ -867,7 +1012,7 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
     width = int(v.get("width") or 0)
     height = int(v.get("height") or 0)
     a.container_fps = v.get("r_frame_rate")
-    a.tier, tier_why = resolve_tier(path, height)
+    a.tier, tier_why = resolve_tier(path, height, tier)
     a.crf = TIERS[a.tier]["crf"]
     a.notes.append(
         f"tier {a.tier} ({tier_why}); preset {TIERS[a.tier]['preset']}, "
@@ -924,7 +1069,7 @@ def analyze(path: Path, out_dir: Path, version: str, git_sha: str,
     a.ffmpeg_version = ffmpeg_version()
     a.x265_version = x265_version()
     resolve_color(a, v, height)
-    resolve_audio(a, streams)
+    resolve_audio(a, streams, duration)
     resolve_subtitles(a, streams)
 
     if not a.needs_review:
@@ -1023,6 +1168,9 @@ def add_args(ap: argparse.ArgumentParser) -> None:
                     help="re-analyze titles that already have a plan")
     ap.add_argument("--quick", action="store_true",
                     help="fewer samples; faster, less reliable")
+    ap.add_argument("--tier", choices=sorted(TIERS),
+                    help="force this tier for every source in the run, "
+                         "instead of deciding it from the path")
 
 
 def run_cmd(args: argparse.Namespace) -> int:
@@ -1049,7 +1197,8 @@ def run_cmd(args: argparse.Namespace) -> int:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(analyze, f, out_dir, "4.0", sha, args.quick): f
+            pool.submit(analyze, f, out_dir, "4.0", sha, args.quick,
+                        getattr(args, "tier", None)): f
             for f in todo
         }
         for fut in concurrent.futures.as_completed(futures):

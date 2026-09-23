@@ -185,7 +185,27 @@ def _pts_bounds(path: Path, stream: str) -> tuple[float | None, float | None]:
     return (min(h) if h else None, max(t) if t else None)
 
 
-def av_drift(path: Path) -> float | None:
+def audio_position(streams: list[dict], source_index: int) -> int | None:
+    """Position of an absolute stream index among a file's own audio streams.
+
+    Needed to build an ffprobe stream specifier ("a:N") that names the SAME
+    physical track in two different files. A plan can reorder audio - Friends
+    s10e17e18 promotes a secondary 2-channel track (source_index 2) to be the
+    output's first audio stream, while in the source that same track is
+    second (a:1). Comparing "a:0 of output" to "a:0 of source" then silently
+    compares two different tracks: the promoted secondary track against the
+    source's main track, which was never desynced. Matching by source_index
+    instead of container position compares each track to itself.
+    """
+    audio = sorted((s for s in streams if s.get("codec_type") == "audio"),
+                   key=lambda s: s.get("index", 0))
+    for i, s in enumerate(audio):
+        if s.get("index") == source_index:
+            return i
+    return None
+
+
+def av_drift(path: Path, v: str = "v:0", a: str = "a:0") -> float | None:
     """How far audio and video pull apart across a file, in seconds.
 
     Computed as (audio-video skew at the end) minus (the same skew at the
@@ -195,19 +215,23 @@ def av_drift(path: Path) -> float | None:
     that grows over the runtime means a frame-rate or cadence assumption is
     wrong somewhere.
 
+    `v`/`a` let the caller name a specific stream rather than assume "a:0" -
+    see audio_position and the caller in verify_one for why that assumption
+    is not safe in general.
+
     Only valid on a file that was NOT produced with an input seek - see
     av_span_ratio for why, and use that one for samples.
 
     Returns None when there is no audio stream, or timestamps are unreadable.
     """
-    v_start, v_end = _pts_bounds(path, "v:0")
-    a_start, a_end = _pts_bounds(path, "a:0")
+    v_start, v_end = _pts_bounds(path, v)
+    a_start, a_end = _pts_bounds(path, a)
     if None in (v_start, v_end, a_start, a_end):
         return None
     return (a_end - v_end) - (a_start - v_start)
 
 
-def av_span_ratio(path: Path) -> float | None:
+def av_span_ratio(path: Path, v: str = "v:0", a: str = "a:0") -> float | None:
     """Video timespan divided by audio timespan. 1.0 means they cover the
     same stretch of time; below 1.0 the video is short against its audio.
 
@@ -224,8 +248,8 @@ def av_span_ratio(path: Path) -> float | None:
     the 4/5 that dropping one frame in five produces, against 0.996 for the
     correct encode of the same source.
     """
-    v_start, v_end = _pts_bounds(path, "v:0")
-    a_start, a_end = _pts_bounds(path, "a:0")
+    v_start, v_end = _pts_bounds(path, v)
+    a_start, a_end = _pts_bounds(path, a)
     if None in (v_start, v_end, a_start, a_end):
         return None
     a_span = a_end - a_start
@@ -388,22 +412,60 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
     # decimating already-progressive 23.976 content drops one real frame in
     # five, so the video runs short against an audio track that was copied
     # untouched, and the gap grows all the way through the file.
+    #
+    # Which audio stream to use for the comparison matters. Two failure modes
+    # measured on Friends 2026-09-19, both false positives - the encode was
+    # fine in both:
+    #
+    # 1. A plan can reorder audio: s10e17e18 promotes a secondary 2-channel
+    #    track (source_index 2) to the output's first audio stream, while in
+    #    the source that same track is second (a:1). Naive "a:0 vs a:0"
+    #    compares the promoted secondary track against the source's DIFFERENT
+    #    main track - it read a -2328ms "failure" that was really the fact
+    #    that the secondary track was never in sync with the main one to
+    #    begin with. audio_position fixes this by matching source_index, not
+    #    container position.
+    #
+    # 2. A re-encoded track (the AAC downmix) re-derives its PTS from decoded
+    #    sample count, so it cannot carry forward whatever small container-
+    #    level PTS quirk the source's raw track has - it measured -5333ms and
+    #    -965ms on two Friends sources that were, on direct inspection, fine.
+    #    A copied track has no such gap: it is bit-identical to the source,
+    #    so it is the only stream a source comparison is actually meaningful
+    #    for. Prefer it when the plan has one.
+    audio_plan = plan.get("audio", [])
+    copy_pos = next((i for i, a in enumerate(audio_plan)
+                      if a.get("codec") == "copy"), None)
+    a_out = f"a:{copy_pos if copy_pos is not None else 0}"
+    a_src = "a:0"
+    if audio_plan:
+        idx = copy_pos if copy_pos is not None else 0
+        if idx < len(audio_plan):
+            src_index = audio_plan[idx].get("source_index")
+            if src_index is not None and src.exists():
+                try:
+                    pos = audio_position(probe(src)["streams"], src_index)
+                    if pos is not None:
+                        a_src = f"a:{pos}"
+                except Exception:  # noqa: BLE001
+                    pass
+
     if sample:
         # A sampled encode is cut with an input seek, which offsets the
         # video's first PTS from the audio's and makes av_drift meaningless.
         # The span ratio is immune to that.
-        ratio = av_span_ratio(dst)
+        ratio = av_span_ratio(dst, a=a_out)
         if ratio is not None and abs(1.0 - ratio) > SPAN_RATIO_TOL:
             problems.append(
                 f"video covers {ratio*100:.1f}% of the audio timespan "
                 "- video is running short against its audio")
         drift_out = None
     else:
-        drift_out = av_drift(dst)
+        drift_out = av_drift(dst, a=a_out)
     if drift_out is None:
         pass  # sample (handled above), no audio, or unreadable timestamps
     elif src.exists():
-        drift_src = av_drift(src)
+        drift_src = av_drift(src, a=a_src)
         if drift_src is None:
             # The source could not be measured - on a very large Matroska the
             # audio tail probe hits PTS_PROBE_TIMEOUT (measured: every Blu-ray

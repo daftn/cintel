@@ -96,23 +96,32 @@ is a runnable module.
 python3 cintel analyze /nas/media/raw/dvd/tv/charmed --out plans/charmed --jobs 4
 
 # validate a plan cheaply - 90s from mid-file, exercises every code path
-python3 cintel encode plans/charmed --out /data/cintel-stage --work /data/cintel-work \
+python3 cintel encode plans/charmed --out /nas/media/encoded/charmed --work /nas/media/encoded/charmed-work \
     --flatten --sample 90
 
 # encode for real (nice/ionice: Jellyfin and Plex share this host)
 nice -n 15 ionice -c3 python3 cintel encode plans/charmed \
-    --out /data/cintel-stage --work /data/cintel-work --flatten --jobs 3
+    --out /nas/media/encoded/charmed --work /nas/media/encoded/charmed-work --flatten --jobs 3
 
 # verify (add --sample if the output is a sample)
-python3 cintel verify plans/charmed --out /data/cintel-stage --flatten
+python3 cintel verify plans/charmed --out /nas/media/encoded/charmed --flatten
 
 # publish
-python3 cintel publish plans/charmed --from /data/cintel-stage \
-    --to /nas/media/tv/kids/Charmed --retire /data/cintel-retired --seasons
+python3 cintel publish plans/charmed --from /nas/media/encoded/charmed \
+    --to /nas/media/tv/kids/Charmed --retire /nas/media/encoded/charmed-retired --seasons
 ```
 
 Useful flags: `--force` (re-analyze), `--limit N`, `--dry-run`, `--progress`,
-`--ignore-stale`, `--replace`, `--remap OLD=NEW`, `--jobs N` (encode concurrency).
+`--ignore-stale`, `--replace`, `--remap OLD=NEW`, `--jobs N` (encode concurrency),
+`--tier NAME` (analyze; force one tier for the whole run).
+
+**Tier comes from the path; `--tier` is the exception.** Drop a rip into
+`raw/bluray/tv/`, `raw/bluray/movies/film/` or `raw/bluray/movies/standard/` and the tier
+follows from where it sits (anything left loose in `raw/bluray/movies/` falls to
+`bluray-film`, the careful side) — which survives the re-analysis that every change to
+`analyze.py` forces, whereas a flag typed once does not. `--tier` is for a homogeneous
+batch you would rather not file by hand. Either way the plan records which one decided,
+and resolution still wins: an SD source cannot be forced into a Blu-ray tier.
 
 **Scratch belongs on `/data`, never on `/`.** The container rootfs is 20 GB; `/data` is
 1.8 TB of NVMe. A single Blu-ray `.partial` can be 8–10 GB.
@@ -147,6 +156,46 @@ percent throughput.
 
 ---
 
+## The `/nas/media` layout
+
+Counts below are as of 2026-09-21. The shape matters more than the numbers: **movies and
+TV are each split by audience**, and a count taken from one subdirectory is not the
+library total. Getting this wrong is how a doc ended up claiming "86 films."
+
+```
+/nas/media/
+├── movies/          223 films, split by audience
+│   ├── no_kids/         72      <- the tier this pipeline mostly feeds
+│   ├── older_kids/      58
+│   └── younger_kids/    93
+├── tv/              split the same way
+│   ├── no_kids/         11 shows
+│   └── kids/             3 shows
+├── raw/             SOURCES - never deleted, tier decided by path
+│   ├── bluray/
+│   │   ├── movies/      film/ -> bluray-film, standard/ -> bluray-standard
+│   │   └── tv/          -> bluray-tv
+│   ├── dvd/
+│   │   ├── movies/      436 titles
+│   │   └── tv/          4 shows
+│   └── processed/       sources already encoded, kept as archive
+├── ingest/          raw MakeMKV dumps, _tNN names, awaiting identification
+├── encoded/         staging and work dirs; empty between batches
+├── audio/           .m4a listening extracts (NOT produced by cintel)
+│   ├── TV/              per-show, per-season
+│   └── Movies/
+├── photos/          not ours
+└── youtube/         not ours
+```
+
+`raw/` is the archive of record: a source is moved to `raw/processed/<name>/` after its
+encode is verified and shelved, never deleted, so any title can be re-encoded when a
+decision changes. Replaced library files follow the same habit — they move to a
+`*-retired` directory rather than being deleted, though those directories are pruned by
+hand once the replacement has been checked, so do not expect them to exist.
+
+---
+
 ## Current configuration
 
 ```
@@ -175,44 +224,59 @@ much a title is worth to its owner, which nothing can measure.
 
 ---
 
-## State as of 2026-09-15
+## State as of 2026-09-21
 
-**Two shows delivered and published.**
+**Four shows delivered and published.**
 
-| | Episodes | Output | Replaced |
-|---|---:|---:|---:|
-| Charmed | 173 | 63 GB | 132 GB |
-| Buffy | 143 | 47 GB | 136 GB |
+| | Episodes |
+|---|---:|
+| Charmed | 173 |
+| Buffy | 143 |
+| Friends | 226 |
+| The 100 | 100 (99 encoded + 1 pre-existing mp4 for s06e05) |
+
+The **`bluray-film` tier is complete** — all 14 titles. Those sit among the 72 films in
+`movies/no_kids/`; the movie library as a whole is 223 across all three audience tiers,
+most of which predate this pipeline.
 
 - Charmed fixed a genuinely broken library: the old encodes ran at **25.833 fps** with a
   **bt709 transfer on SD content**. Both corrected.
 - Buffy: 63 of 143 episodes deinterlaced, 80 passed through clean. Enabled after the owner
   compared a repaired episode against an unrepaired one by eye.
-- **15 bugs found and fixed, all by measurement.** Bugs 12-15 were *measurement* defects,
-  not encode defects — see `docs/handoff.md` §5.
+- **18 bugs found by measurement (17 fixed, 1 open).** Recent bugs (#16-18) hit Friends, including a commentary track wrongly selected as default audio (fixed) and a cadence filter dropping frames on a mixed-cadence file (open).
 - Throughput measured: **5.08 min** per 43.5-min DVD episode at `--jobs 3`; **4.78 min** for
   Buffy unfiltered, **6.15 min** with the deint chain.
 - Blu-ray tiers split and each CRF measured against a lossless FFV1 reference (§3.6a).
 
-- `bluray-film` validated end to end: Hot Fuzz, **4h55m at 0.41x realtime**, 12.16 GB from
-  30.7 GB, verified. Tier projects to ~78 h for all 14 films.
-
 **Next** (detail in `docs/handoff.md` §7.1):
 
-1. Verify Hot Fuzz, then the remaining 13 `bluray-film` titles (~60 h)
-2. `bluray-standard`, 15 titles (~24 h)
-3. Name the `ingest/` backlog — Dexter (33) needs disc mapping; Thornberrys S2P3/S3 (31) does not
-4. Measure `tune=animation` before encoding the cartoons
-5. The DVD queue: parks and rec, the 100, ash vs evil dead, then 436 movies
+1. The Office Blu-ray "Superfan" (147 eps, renamed but not analyzed/encoded). *Trap: do not conflate with the 185-file DVD rip.*
+2. `bluray-standard`, 23 titles
+3. `bluray-film` (additional 5 staged in `raw/bluray/movies/film/`)
+4. Name the `ingest/` backlog — currently The Office Season 8 discs, still being ripped.
+   Dexter and the Thornberrys have since been cleared out; re-check `ingest/` rather than
+   trusting this list.
+5. Measure `tune=animation` before encoding the cartoons
+6. The DVD queue: 4 shows in `raw/dvd/tv/` (ash vs evil dead, parks and recreation, the
+   office, wild thornberrys), then 436 movies in `raw/dvd/movies/`
 
 **Known open items:**
 
+- **Bug 17 (OPEN):** `classify_cadence` misses short progressive stretches in telecined files.
+- Episode titles for S1/S3/S4/S5/S7 Office audio are plain `sNNeNN`.
+- Season 7 of The Office numbering (mapped as doubles, giving 27 instead of 26 eps).
+- Killing Eve: existing episodes used weak old HandBrake script (`sao`, `aq-mode=2`), re-encode recommended.
+- 13 zero-byte macOS `._` AppleDouble stubs in `tv/no_kids/The 100/` root.
+- The 100 `s02e08` source has 33 concealed decode errors — well under a second of
+  artifacts, auto-concealed. Re-rip only if that disc is already to hand.
 - Per-episode crop varies within a series (cosmetic); a `--uniform-crop` mode would fix it
 - Plan filenames derive from the source stem, so identical basenames in different
   directories would collide silently
 - Very large titles (60 GB+) lose the A/V drift check — audio seeks are pathological in big
   Matroska files; every other check still runs
-- `bluray-tv` rests on one Killing Eve episode; re-measure when Office/BBT discs arrive
+- `bluray-tv` still rests on one Killing Eve episode. The Office discs have now arrived
+  (147 raws staged, Next item 1) — re-measure the tier against them before committing to
+  a ~500-episode run
 
 ## Data
 
