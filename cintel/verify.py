@@ -518,7 +518,7 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
 
     # --- optional VMAF ------------------------------------------------------
     if vmaf and src.exists():
-        score = run_vmaf(src, dst, src_mid, plan.get("tier") == "dvd")
+        score = run_vmaf(src, dst, src_mid, plan.get("tier") == "dvd", plan.get("crop"))
         if score is None:
             problems.append("VMAF could not be computed")
         elif score < 90:
@@ -526,15 +526,25 @@ def verify_one(plan_file: Path, out_root: Path, flatten: bool,
     return (not problems, problems)
 
 
-def run_vmaf(src: Path, dst: Path, start: int, upscale: bool) -> float | None:
+def run_vmaf(src: Path, dst: Path, start: int, upscale: bool,
+              crop: list[int] | None = None) -> float | None:
     """SD content is upscaled to 1080p first: the default VMAF model is trained
-    at 1080p and scores are not meaningful at 480p without it."""
+    at 1080p and scores are not meaningful at 480p without it.
+
+    Bug (found 2026-09-25, on Bourne Ultimatum): this never applied the plan's
+    own crop to the source before comparing. The source still carries its
+    letterbox bars; the output does not. For any title with non-trivial crop
+    that's a severe framing mismatch, not a quality measurement - it produced
+    single-digit VMAF on a visually clean encode. `dst` is never cropped here;
+    it was already cropped by the plan it was encoded from.
+    """
+    src_pre = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     if upscale:
-        fc = ("[0:v]scale=1920:1080:flags=bicubic,setsar=1[ref];"
+        fc = (f"[0:v]{src_pre}scale=1920:1080:flags=bicubic,setsar=1[ref];"
               "[1:v]scale=1920:1080:flags=bicubic,setsar=1[dis];"
               "[dis][ref]libvmaf")
     else:
-        fc = "[1:v][0:v]libvmaf"
+        fc = f"[0:v]{src_pre}null[ref];[1:v][ref]libvmaf"
     cp = run(["ffmpeg", "-nostdin", "-ss", str(start), "-t", "20", "-i", str(src),
               "-ss", str(start), "-t", "20", "-i", str(dst),
               "-filter_complex", fc, "-f", "null", "-"], timeout=900)

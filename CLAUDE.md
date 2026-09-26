@@ -224,9 +224,9 @@ much a title is worth to its owner, which nothing can measure.
 
 ---
 
-## State as of 2026-09-21
+## State as of 2026-09-26
 
-**Four shows delivered and published.**
+**Seven shows delivered and published, plus the movie library's first DVD-tier batch.**
 
 | | Episodes |
 |---|---:|
@@ -234,39 +234,53 @@ much a title is worth to its owner, which nothing can measure.
 | Buffy | 143 |
 | Friends | 226 |
 | The 100 | 100 (99 encoded + 1 pre-existing mp4 for s06e05) |
+| Ash vs Evil Dead | 30 |
+| Parks and Recreation | 122 files / 125 eps |
+| The Office (Blu-ray) | 194 files / 202 eps |
 
-The **`bluray-film` tier is complete** — all 14 titles. Those sit among the 72 films in
-`movies/no_kids/`; the movie library as a whole is 223 across all three audience tiers,
-most of which predate this pipeline.
+The **`bluray-film` tier is complete** — all 14 titles, though 9 of them needed a follow-up
+audio-only remux (below). Those sit among the 72 films in `movies/no_kids/`; the movie
+library as a whole is 223 across all three audience tiers, most of which predate this
+pipeline — except now the DVD movie queue is also underway: **100 of 436 encoded and
+verified** (batch 1), **336 analyzing/encoding** (batch 2). This is the first time the `dvd`
+tier has ever been run on movie content rather than a TV show.
 
 - Charmed fixed a genuinely broken library: the old encodes ran at **25.833 fps** with a
   **bt709 transfer on SD content**. Both corrected.
 - Buffy: 63 of 143 episodes deinterlaced, 80 passed through clean. Enabled after the owner
   compared a repaired episode against an unrepaired one by eye.
-- **18 bugs found by measurement (17 fixed, 1 open).** Recent bugs (#16-18) hit Friends, including a commentary track wrongly selected as default audio (fixed) and a cadence filter dropping frames on a mixed-cadence file (open).
-- Throughput measured: **5.08 min** per 43.5-min DVD episode at `--jobs 3`; **4.78 min** for
-  Buffy unfiltered, **6.15 min** with the deint chain.
+- Parks and Office each turned up a real episode-numbering error before publish — see
+  `docs/handoff.md` §7.1. Not code bugs; a disc-order/duration-outlier identification method
+  that needs a real episode-count source to corroborate against, not just duration.
+- 9 `bluray-film` titles shipped a commentary track mislabeled as the disc's stereo mix
+  (analyzed before the bug-18 fix existed). Fixed with an **audio-only remux** — video
+  stream-copied untouched, no re-encode — confirmed by measured `av_drift` to introduce no
+  timing drift.
+- **20 bugs found by measurement (19 fixed, 1 open).** Bug 20: `verify.py`'s `--vmaf` never
+  applied a plan's own crop to the source before comparing, producing single-digit scores on
+  a visually clean encode. Fixed; validated via the real `--vmaf` CLI path. See bug log.
+- Throughput measured: **5.08 min** per 43.5-min DVD episode at `--jobs 3` (TV); DVD movies
+  run **~5.6 titles/hour** at `--jobs 3`, far cheaper than any Blu-ray tier.
 - Blu-ray tiers split and each CRF measured against a lossless FFV1 reference (§3.6a).
 
 **Next** (detail in `docs/handoff.md` §7.1):
 
-1. The Office Blu-ray "Superfan" (147 eps, renamed but not analyzed/encoded). *Trap: do not conflate with the 185-file DVD rip.*
-2. `bluray-standard`, 23 titles
-3. `bluray-film` (additional 5 staged in `raw/bluray/movies/film/`)
-4. Name the `ingest/` backlog — currently The Office Season 8 discs, still being ripped.
-   Dexter and the Thornberrys have since been cleared out; re-check `ingest/` rather than
-   trusting this list.
-5. Measure `tune=animation` before encoding the cartoons
-6. The DVD queue: 4 shows in `raw/dvd/tv/` (ash vs evil dead, parks and recreation, the
-   office, wild thornberrys), then 436 movies in `raw/dvd/movies/`
+1. Finish DVD movies batch 2 (336 titles), verify, owner's audience-folder sort, publish.
+2. `bluray-standard`, 26 titles staged, never analyzed.
+3. `bluray-film`, 5 more staged in `raw/bluray/movies/film/`.
+4. Big Bang Theory — 8 discs (S1-4) unnamed in `ingest/`. Same disc-order naming work Office
+   needed; also the next real test of whether `bluray-tv` CRF 21 holds up on bright
+   multi-cam sitcoms (flagged, not yet measured).
+5. Wild Thornberrys (DVD) — `tune=animation` still unmeasured, don't encode blind.
+6. `raw/dvd/tv/the office/`, a 185-file DVD rip — almost certainly superseded by the
+   Blu-ray Superfan version now finished; probably archive without encoding.
 
 **Known open items:**
 
 - **Bug 17 (OPEN):** `classify_cadence` misses short progressive stretches in telecined files.
-- Episode titles for S1/S3/S4/S5/S7 Office audio are plain `sNNeNN`.
-- Season 7 of The Office numbering (mapped as doubles, giving 27 instead of 26 eps).
 - Killing Eve: existing episodes used weak old HandBrake script (`sao`, `aq-mode=2`), re-encode recommended.
-- 13 zero-byte macOS `._` AppleDouble stubs in `tv/no_kids/The 100/` root.
+- ~~13 zero-byte macOS `._` AppleDouble stubs in `tv/no_kids/The 100/` root~~ —
+  **resolved**, removed and reconfirmed clean 2026-09-26.
 - The 100 `s02e08` source has 33 concealed decode errors — well under a second of
   artifacts, auto-concealed. Re-rip only if that disc is already to hand.
 - Per-episode crop varies within a series (cosmetic); a `--uniform-crop` mode would fix it
@@ -274,9 +288,12 @@ most of which predate this pipeline.
   directories would collide silently
 - Very large titles (60 GB+) lose the A/V drift check — audio seeks are pathological in big
   Matroska files; every other check still runs
-- `bluray-tv` still rests on one Killing Eve episode. The Office discs have now arrived
-  (147 raws staged, Next item 1) — re-measure the tier against them before committing to
-  a ~500-episode run
+- `--vmaf` is improved (bug 20 fixed) but not fully trusted — an unexplained anomaly during
+  that investigation was never root-caused. Prefer the §4.2 FFV1-reference method for any
+  CRF/quality decision that matters.
+- `bluray-tv` was re-measured against real Office content (vertical slice before the
+  194-episode run) rather than resting solely on one Killing Eve episode — but Big Bang
+  Theory (next item 4) is a better proxy still for bright multi-cam sitcoms specifically.
 
 ## Data
 

@@ -744,6 +744,7 @@ All were found by measurement. None by reasoning.
 | 17 | `classify_cadence` only detects mixed film/video content from the 3-point decoded-fps sample | Missed a ~16s locally-progressive stretch in Friends s05e04 that the combing scan itself had flagged (one window read 52% progressive against 0% everywhere else) — the file was classified uniform `telecine`, and `fieldmatch,decimate` dropped ~225 real frames there. Still open; s05e04 was fixed by hand (whole-file `DEINT_FILTER`, no decimation) rather than by a code fix |
 | 18 | `resolve_audio` trusted any secondary 2-channel English track as "the disc's own stereo mix" | **A commentary track shipped as the default stereo audio**, found by the owner mid-episode. No metadata distinguishes commentary from a genuine alternate mix — MakeMKV had even tagged one commentary track "Stereo" with `disposition.comment` unset. 27 of 226 Friends episodes hit this; all 27 were commentary. Fixed with `tracks_correlate`: cross-correlate the candidate track against the main mix, reject below 0.15. First version used max-of-2-windows and still passed 3 of the 27 - a commentary track goes quiet exactly when the commentator does, leaving only the ducked show audio, which correlates fine for that stretch (one window hit 0.21). Same trap as bug 12; fixed the same way, with the same fix: 7 windows spread across the runtime, median not max |
 | 19 | `tracks_correlate` returning `None` (unmeasurable) was treated as "pass" | Fixed by 18 on Ash vs Evil Dead, then re-broken by its own edge case: 4 of 30 episodes' "English Stereo" track was a 31-packet stub covering about one second of runtime, not real audio - the same failure shape as bug 7's degenerate subtitle track, on audio instead. Correlation correctly found nothing to measure and returned `None`; the caller read `corr is not None and corr < THRESHOLD` as false and trusted the track anyway, which would have shipped near-silent audio as the default. `None` now takes the same branch as a measured failure |
+| 20 | `run_vmaf` never applied the plan's own crop to the source before comparing | Found investigating a quality complaint on Bourne Ultimatum (DVD movie tier, first real use of `--vmaf` on movie content): the source still carries its full letterbox bars, the output does not, so at any non-trivial crop (Bourne's removes 26% of frame height) the two frames being "compared" show different portions of the picture stretched to fill the same box. Produced single-digit VMAF on a visually clean encode - measured by eye, frame-by-frame, before the score was trusted. Fixed by cropping the source in the filter graph before scaling, in both the SD-upscale and non-upscale branches. Validated end to end via the real `--vmaf` CLI path post-fix: Bourne Ultimatum now reads a believable 81.9 at its file midpoint, consistent with the owner's own playback impression ("way good compared to the old DVD script"). Ad-hoc deeper testing during the investigation (a hand-built lossless x265 round-trip that still read ~68 after the crop fix) never got a clean explanation and is **not** attributed to this bug - visual inspection of that exact case showed frames identical to source, so it reflects some artifact of that one-off test construction, not the real `verify.py` code path. Treat `--vmaf`'s output as directionally useful now, not yet as fully trusted as the §4.2 FFV1-reference method |
 
 ### 5.1 Bug 7 in detail — the one to understand
 
@@ -797,46 +798,57 @@ episode** at `medium` CRF 20, roughly 4–5× realtime. Charmed ≈ 25 hours sin
 
 ## 7. What is left
 
-### 7.1 Immediate (rewritten 2026-09-15)
+### 7.1 Immediate (rewritten 2026-09-26)
 
-Everything in the original list is done: plans regenerated, full encodes run across a long
-movie, a Blu-ray, an untested show and a degenerate-sub file, and Office dropped.
+Everything in the 2026-09-15 list is done, and considerably more besides: `bluray-film`
+finished all 14 titles, three more shows landed (Ash vs Evil Dead, Parks and Recreation, the
+full 194-episode Office Blu-ray "Superfan"), `bluray-tv` got its real re-measurement against
+Office instead of resting on one Killing Eve episode, and the DVD queue's *movie* half has
+started - the first time this pipeline has ever touched a DVD movie rather than a DVD show.
 
 **Delivered**
 
-| | Episodes | Output | Replaced | Notes |
-|---|---:|---:|---:|---|
-| Charmed | 173 | 63 GB | 132 GB | fixed 25.833fps timing + bt709 transfer on SD |
-| Buffy | 143 | 47 GB | 136 GB | 63 episodes deinterlaced, 80 clean |
+| | Episodes/Titles | Notes |
+|---|---:|---|
+| Charmed | 173 | fixed 25.833fps timing + bt709 transfer on SD |
+| Buffy | 143 | 63 episodes deinterlaced, 80 clean |
+| Friends | 226 | bugs 16-18 found here (audio identity, cadence gap, commentary) |
+| The 100 | 100 | 99 encoded + 1 pre-existing mp4 (s06e05) |
+| Ash vs Evil Dead | 30 | bug 19 found here (degenerate-track None-handling) |
+| Parks and Recreation | 122 files / 125 eps | pre-existing library was 100% macOS junk, rebuilt from raw; a real numbering error (S5's finale was mislabeled e13, duplicate-numbered against "Emergency Response") found and fixed by cross-checking Wikipedia |
+| The Office (Blu-ray) | 194 files / 202 eps | full pipeline incl. a deliberate vertical-slice validation of `bluray-tv` before committing to the run; two seasons (7, 9) each had one spuriously-doubled single episode, found and fixed the same way as Parks - see below |
+| `bluray-film` | 14/14 | tier complete. 9 of the 14 were later found to ship a commentary track mislabeled as the disc's stereo mix (analyzer predated the bug-18 fix) - patched with an **audio-only remux**, not a re-encode: video stream-copied untouched, bad track dropped, fresh AAC downmix built from the archived raw's lossless surround. Confirmed via `av_drift`/`av_span_ratio` that this introduced no timing drift |
+| DVD movies, batch 1 | 100/436 | **first-ever DVD movie run** on this pipeline - every prior DVD batch was a TV show. Verified 100/100 PASS; stratified vertical slice (1962-2006, colour and B&W) run first per §3.12. Awaiting the owner's audience-folder sort before publish |
+| DVD movies, batch 2 | 336/436 | in progress, same tier, no vertical slice needed - already validated on batch 1 |
 
-**`bluray-film` validated end to end (2026-09-15).** Hot Fuzz at `slow` CRF 19:
-
-| | |
-|---|---|
-| Encode | **4h55m**, 0.41x realtime, solo at `--jobs 1` |
-| Output | 12.16 GB from a 30.7 GB source |
-| Streams | hevc Main 10 1920x814 bt709, ac3 2ch copied, **eac3 6ch from DTS-HD MA**, 1 eng PGS |
-| Verify | PASS (after bug 15) |
-
-This is the first full-length exercise of the lossless-audio transcode, which is the one
-irreversible decision in the pipeline. Projected for the tier: **~78 hours** for all 14
-films' 32 hours of content, so ~73 hours for the remaining 13. Kill Bill is ~9.4 h of that.
+**A recurring methodology finding, not a code bug:** the disc-order + duration-outlier method
+used to spot merged double episodes (§3.12-adjacent, established on Friends/Office) has now
+been wrong twice in the same specific way - a single "super-sized" episode (long, but never
+split into two broadcast numbers) gets mistaken for a real two-parter because nothing in the
+disc structure distinguishes them, only real episode-count knowledge does. Office S7's
+`e22e23` and S9's `e16e17` were both this - fixed by cross-checking Wikipedia's actual
+episode list, which also resolved two counts this project's own docs had previously flagged
+as unconfirmed ("26 vs 27" for S7). Corroborate any future duration-outlier double-episode
+guess against a real source before it ships, the way S3's was originally corroborated -
+duration alone is not sufficient evidence, it was just the only evidence available at the
+time.
 
 **Next, in order of value**
 
-1. **Verify Hot Fuzz**, then encode the remaining 13 `bluray-film` titles (~60 h). These are
-   the owner's stated priority. Kill Bill alone is ~9.4 h at 4h13m.
-2. **`bluray-standard`**, 15 titles (~24 h). Settings measured on Fast Five (§3.6a).
-3. **Name the `ingest/` backlog.** Dexter's 33 files are `1.mkv`-`26.mkv` plus
-   `C1_t01`-`D2_t07`, with no disc grouping to order by - the mapping cannot be inferred
-   from the files and must come from the discs. The Thornberrys S2P3/S3 rips (31 files) do
-   have disc directories and can be named the same way S1/S2 were.
-4. **Measure `tune=animation`.** Both cartoons classify `video` cadence with 30-50%
-   *legitimate* duplicate frames (drawn on twos). x265's animation tuning is unused and
-   untested here; flat cel-shaded content at CRF 20 is where it would matter.
-5. **The DVD queue** - parks and recreation, the 100, ash vs evil dead, then 436 movies.
-6. **Re-measure `bluray-tv`** when the Office and Big Bang Theory discs arrive. Killing Eve
-   is a dark drama and a poor proxy for lit multi-cam sitcoms (§3.6a).
+1. **Finish DVD movies batch 2** (336 titles, ~2.3 days at last measurement), then verify,
+   then the owner's audience sort, then publish.
+2. **`bluray-standard`**, 26 titles staged, never analyzed. Settings measured on Fast Five
+   (§3.6a) but never run on real bluray-standard content.
+3. **`bluray-film`**, 5 more titles staged in `raw/bluray/movies/film/`.
+4. **Big Bang Theory**, 8 discs (S1-4) sitting unnamed in `ingest/`. Same disc-order naming
+   work Office needed - watch for the same spurious-double trap above. Also the next real
+   test of whether `bluray-tv`'s CRF 21 is too conservative for bright multi-cam sitcoms,
+   flagged but not measured during the Bourne Ultimatum VMAF investigation (bug 20).
+5. **Wild Thornberrys** (DVD) - `tune=animation` still unmeasured, don't encode blind.
+6. **Killing Eve** re-encode - still just a recommendation, never decided.
+7. `raw/dvd/tv/the office/`, a 185-file DVD rip - almost certainly superseded by the
+   Blu-ray Superfan version now finished; probably archive without encoding rather than
+   duplicate the effort.
 
 **Known open, carried forward**
 
@@ -846,6 +858,10 @@ films' 32 hours of content, so ~73 hours for the remaining 13. Kill Bill is ~9.4
   different directories collide silently. Still zero collisions, but the `ingest/` files
   named `1.mkv` would have caused one.
 - Very large titles lose the A/V drift check (§4 gotchas, Kill Bill at 62 GB).
+- **`--vmaf`'s reliability is now improved but not fully trusted** (bug 20) - the crop
+  mismatch is fixed and validated, but an unexplained anomaly during that investigation
+  (a controlled lossless test that should have scored ~99 and didn't) was never root-caused.
+  Prefer the §4.2 FFV1-reference method for any CRF/quality decision that matters.
 
 ### 7.1a Encode concurrency
 
@@ -974,10 +990,12 @@ deleting them, so rollback is a `mv`.
   VapourSynth VIVTC would still recover true 24p from genuinely mixed content and remains
   the better tool — but with zero refused files it is no longer justified against the
   zero-dependency property.
-- **13 movies have no surviving source.** 4 of those are damaged (`007 - Dr. No` has no
-  source but is *not* damaged — see the §3.4 retraction; the real four are `U571`,
-  `Land Before Time 6`, `Land Before Time 7`, and one other). Those need a re-rip, not a
-  re-encode.
+- **13 movies have no surviving source.** 4 of those are damaged (the real four are `U571`,
+  `Land Before Time 6`, `Land Before Time 7`, and one other) - those need a re-rip, not a
+  re-encode. `007 - Dr. No` was previously listed here as sourceless; it is not - its raw
+  sat in `raw/dvd/movies/` and was analyzed, encoded, and verified clean in the first DVD
+  movie batch (2026-09-26), part of a stratified vertical slice specifically chosen for its
+  age. Corrected here rather than left to mislead the next reader.
 - **Bazarr is not set up.** It is the recommended answer for day-to-day subtitles.
 
 ---
