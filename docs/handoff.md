@@ -816,10 +816,47 @@ started - the first time this pipeline has ever touched a DVD movie rather than 
 | The 100 | 100 | 99 encoded + 1 pre-existing mp4 (s06e05) |
 | Ash vs Evil Dead | 30 | bug 19 found here (degenerate-track None-handling) |
 | Parks and Recreation | 122 files / 125 eps | pre-existing library was 100% macOS junk, rebuilt from raw; a real numbering error (S5's finale was mislabeled e13, duplicate-numbered against "Emergency Response") found and fixed by cross-checking Wikipedia |
-| The Office (Blu-ray) | 194 files / 202 eps | full pipeline incl. a deliberate vertical-slice validation of `bluray-tv` before committing to the run; two seasons (7, 9) each had one spuriously-doubled single episode, found and fixed the same way as Parks - see below |
+| The Office (Blu-ray) | 194 files / 202 eps | full pipeline incl. a deliberate vertical-slice validation of `bluray-tv` before committing to the run; two seasons (7, 9) each had one spuriously-doubled single episode, found and fixed the same way as Parks - see below. Timed end to end: **70.5h encode + 1.1h verify** at `--jobs 3`, ~21.8 min/episode average |
 | `bluray-film` | 14/14 | tier complete. 9 of the 14 were later found to ship a commentary track mislabeled as the disc's stereo mix (analyzer predated the bug-18 fix) - patched with an **audio-only remux**, not a re-encode: video stream-copied untouched, bad track dropped, fresh AAC downmix built from the archived raw's lossless surround. Confirmed via `av_drift`/`av_span_ratio` that this introduced no timing drift |
-| DVD movies, batch 1 | 100/436 | **first-ever DVD movie run** on this pipeline - every prior DVD batch was a TV show. Verified 100/100 PASS; stratified vertical slice (1962-2006, colour and B&W) run first per §3.12. Awaiting the owner's audience-folder sort before publish |
-| DVD movies, batch 2 | 336/436 | in progress, same tier, no vertical slice needed - already validated on batch 1 |
+| DVD movies, batch 1 | 100/436 | **first-ever DVD movie run** on this pipeline - every prior DVD batch was a TV show. Verified 100/100 PASS; stratified vertical slice (1962-2006, colour and B&W) run first per §3.12. Renamed to Plex convention (`Title (Year).mkv`, franchise prefixes stripped, ~86 titles needed a year/typo/title fix); one title (`DeadByDawn.mkv`) left unidentified - genuinely unclear which film it is. Still awaiting the owner's audience-folder sort before publish |
+| DVD movies, batch 2 | 336/436 analyzed | encode surfaced a real incident - see below. Recovery in progress as of 2026-09-28 |
+
+**The batch 2 encode incident (2026-09-28), and an operational lesson about it.** 70 of
+336 titles failed with `ffmpeg exit 243` / permission denied reading the raw source - a
+NAS-side ACL issue, not a pipeline defect, confirmed resolved by the owner and by directly
+re-testing readability on all 70 sources before retrying. The lesson worth keeping: **encode.py
+marks a failed title with `XX`, not `FAIL`**, and status checks during the run used a grep
+pattern for `FAIL|error`, so **all 70 failures were invisible to "zero errors" status
+reports for the better part of a day** until `verify` (which does print `FAIL`) caught them
+properly. Anyone - human or agent - checking an encode log for failures should grep the
+actual per-title marker (`XX`), not assume a word like "FAIL" appears.
+
+Investigating the failures past the permission group turned up two that were not
+permission-related and, on inspection, were not checker bugs either - genuine encode-time
+defects that `verify` caught exactly as designed:
+
+- **The Deer Hunter**: the encoded output's video track ends ~100 seconds before its audio
+  track (confirmed independently via each stream's own container `DURATION` tag, and by
+  reading the literal last packet of each stream with no interval restriction) - `av_drift`
+  reported this correctly as +99627ms. The raw source is not at fault: its own video track
+  runs the full length, matching audio. Something in this one `ffmpeg` invocation stopped
+  producing video frames ~100s early while audio continued to completion, and the process
+  still **exited 0**. Queued for a straightforward retry.
+- **Shanghai Knights**: +583ms of genuine accumulating A/V drift (source itself carries
+  -12ms, ordinary disc-authored skew) - ruled out as a truncation artifact first (whole-file
+  video/audio `DURATION` tags differ by only 24ms), so this is real progressive drift, not
+  a measurement quirk. Also queued for retry.
+
+Both are a reminder of this project's founding motivation (§1): a successful exit code and
+a plausible file size are not proof of a correct encode. `verify` catching two genuine,
+silent defects in a single batch - on top of the 19 checker bugs it exists because of - is
+current, direct evidence for why it is never optional.
+
+One title (`The Land Before Time: The Big Freeze`) failed on duplicate-frame ratio
+(41.7% vs 5%-tolerance-adjusted source baseline) from imperfect `fieldmatch,decimate`
+pattern-matching on its irregular cadence - a deterministic result, so a retry would not
+fix it. The owner accepted the output as-is rather than hand-tuning the filter for one
+lower-stakes kids' sequel.
 
 **A recurring methodology finding, not a code bug:** the disc-order + duration-outlier method
 used to spot merged double episodes (§3.12-adjacent, established on Friends/Office) has now
@@ -835,8 +872,9 @@ time.
 
 **Next, in order of value**
 
-1. **Finish DVD movies batch 2** (336 titles, ~2.3 days at last measurement), then verify,
-   then the owner's audience sort, then publish.
+1. **Finish DVD movies batch 2 recovery**: 70-title permission retry in progress, then the
+   chained Deer Hunter + Shanghai Knights retry (auto-starts when the 70 finish), then a
+   fresh verify pass, then the owner's audience sort for both batches, then publish.
 2. **`bluray-standard`**, 26 titles staged, never analyzed. Settings measured on Fast Five
    (§3.6a) but never run on real bluray-standard content.
 3. **`bluray-film`**, 5 more titles staged in `raw/bluray/movies/film/`.
@@ -862,6 +900,14 @@ time.
   mismatch is fixed and validated, but an unexplained anomaly during that investigation
   (a controlled lossless test that should have scored ~99 and didn't) was never root-caused.
   Prefer the §4.2 FFV1-reference method for any CRF/quality decision that matters.
+- **`DeadByDawn.mkv`** (DVD movies batch 1) could not be identified - no confident title
+  match, not renamed to Plex convention. Needs the owner to actually look at the file.
+- **`encode.py` failures print `XX`, not `FAIL`** - grep that marker specifically when
+  checking a running batch's log for trouble; `FAIL`/`error` patterns will miss real
+  failures silently, as they did for a day on the batch 2 permission incident above.
+- **A successful `ffmpeg` exit code does not guarantee a complete output stream** - The
+  Deer Hunter (above) produced a video track ~100s short of its audio while exiting 0.
+  Rare, cause not identified, but confirms `verify` must run on every title, no exceptions.
 
 ### 7.1a Encode concurrency
 

@@ -241,9 +241,10 @@ much a title is worth to its owner, which nothing can measure.
 The **`bluray-film` tier is complete** — all 14 titles, though 9 of them needed a follow-up
 audio-only remux (below). Those sit among the 72 films in `movies/no_kids/`; the movie
 library as a whole is 223 across all three audience tiers, most of which predate this
-pipeline — except now the DVD movie queue is also underway: **100 of 436 encoded and
-verified** (batch 1), **336 analyzing/encoding** (batch 2). This is the first time the `dvd`
-tier has ever been run on movie content rather than a TV show.
+pipeline — except now the DVD movie queue is also underway: **100 of 436 encoded, verified,
+and Plex-renamed** (batch 1, awaiting the owner's audience sort), **336 analyzed** and mid
+an encode-recovery incident (batch 2, detail below). This is the first time the `dvd` tier
+has ever been run on movie content rather than a TV show.
 
 - Charmed fixed a genuinely broken library: the old encodes ran at **25.833 fps** with a
   **bt709 transfer on SD content**. Both corrected.
@@ -256,6 +257,14 @@ tier has ever been run on movie content rather than a TV show.
   (analyzed before the bug-18 fix existed). Fixed with an **audio-only remux** — video
   stream-copied untouched, no re-encode — confirmed by measured `av_drift` to introduce no
   timing drift.
+- The Office Blu-ray timed end to end: **70.5h encode + 1.1h verify** at `--jobs 3`,
+  194/194 verified clean.
+- **DVD movies batch 2 hit a real incident**: 70 of 336 titles failed on a NAS permission
+  issue reading the raw source, invisible to status checks for a day because `encode.py`
+  marks a failure `XX`, not `FAIL` — a grep-pattern gap, not a pipeline bug, now fixed in
+  how this project is monitored. Two more failures (The Deer Hunter, Shanghai Knights) were
+  genuine encode-time defects `verify` caught correctly, not checker bugs — see
+  `docs/handoff.md` §7.1 for the detail. Recovery in progress.
 - **20 bugs found by measurement (19 fixed, 1 open).** Bug 20: `verify.py`'s `--vmaf` never
   applied a plan's own crop to the source before comparing, producing single-digit scores on
   a visually clean encode. Fixed; validated via the real `--vmaf` CLI path. See bug log.
@@ -265,7 +274,8 @@ tier has ever been run on movie content rather than a TV show.
 
 **Next** (detail in `docs/handoff.md` §7.1):
 
-1. Finish DVD movies batch 2 (336 titles), verify, owner's audience-folder sort, publish.
+1. Finish DVD movies batch 2 recovery (permission retry, then Deer Hunter/Shanghai Knights
+   retry, then re-verify), owner's audience-folder sort for both batches, publish.
 2. `bluray-standard`, 26 titles staged, never analyzed.
 3. `bluray-film`, 5 more staged in `raw/bluray/movies/film/`.
 4. Big Bang Theory — 8 discs (S1-4) unnamed in `ingest/`. Same disc-order naming work Office
@@ -283,6 +293,10 @@ tier has ever been run on movie content rather than a TV show.
   **resolved**, removed and reconfirmed clean 2026-09-26.
 - The 100 `s02e08` source has 33 concealed decode errors — well under a second of
   artifacts, auto-concealed. Re-rip only if that disc is already to hand.
+- `DeadByDawn.mkv` (DVD batch 1) — could not identify the film, not yet renamed. Needs the
+  owner to look at it.
+- **Grep `XX` for encode failures, not `FAIL`/`error`** — the actual marker `encode.py`
+  prints, learned the hard way on the batch 2 incident.
 - Per-episode crop varies within a series (cosmetic); a `--uniform-crop` mode would fix it
 - Plan filenames derive from the source stem, so identical basenames in different
   directories would collide silently
